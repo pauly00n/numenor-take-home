@@ -35,7 +35,11 @@ npm run dev
 
 Open http://localhost:3000.
 
-- **Create:** click **+ New event**, or click an empty slot in the grid to prefill that time.
+- **Create:** click **+ New event**, or click an empty slot in the grid to prefill that time (1 hour). Or **drag** down or up on empty grid to select a range in 15-minute steps; releasing opens the dialog prefilled with that range.
+- **Resize:** drag an event's **bottom edge** to change its duration, or its **top edge** to change its start while keeping the end. Snaps to 15 minutes with a live preview.
+  - Non-recurring events save on release. Recurring ones ask *This event / This and following / All events* at the cursor.
+  - Esc mid-drag, or Cancel, puts it back.
+  - Edges cut off at midnight have no handle.
 - **Edit / reschedule:** click an event. For recurring events, pick *This event*, *This and following*, or *All events*.
 - **Cancel:** right-click an event, or use Delete in the edit dialog.
 - **Navigate:** use ‹ / › / Today to move between weeks. The grid scrolls vertically through the day.
@@ -49,6 +53,7 @@ Tests:
 ```sh
 cd backend && uv run pytest                              # ~2s
 cd backend && HYPOTHESIS_PROFILE=heavy uv run pytest     # ~35s, 5000 examples per property
+cd web && npm test                                       # drag math (node's built-in test runner)
 ```
 
 ## Data model
@@ -156,6 +161,7 @@ These found real bugs, each now covered by a regression test:
 - JSON persistence, REST API, and a week-view UI with a create/edit dialog and right-click menu.
 - Conflict detection with explanations (panel, in-grid markers, heads-up on save).
 - Meeting time recommendations within configurable working hours.
+- Drag to create, and drag event edges to resize, in 15-minute steps. The drag math is a pure module with unit tests, and the interactions were checked end to end in Chromium.
 - pytest + hypothesis suite (97 tests) covering recurrence math, DST edge cases, exceptions, scopes, rollback, persistence, scheduling, and the API.
 
 ## Time spent
@@ -167,5 +173,5 @@ _TODO(paul): fill in._
 - **Multi-attendee search:** the same gap math over the union of several calendars' busy time, intersected with each attendee's working hours.
 - The save heads-up only checks the visible week. Checking the saved event's own dates would catch a clash after moving it to another week.
 - **Performance for large calendars:** index events by active date range (start to until) so a window query skips series that can't intersect it.
-- Drag-to-move and resize in the grid, plus month view.
+- Drag an event's body to move it (including across days), plus a month view. Resizing an event by dragging into another day isn't supported yet; edges stay within their column.
 - RFC 5545 import/export (`RRULE`/`EXDATE`/`RECURRENCE-ID` map almost 1:1 onto this model).

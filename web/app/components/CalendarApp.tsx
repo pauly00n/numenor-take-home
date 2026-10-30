@@ -5,6 +5,7 @@ import { api, type Conflict, type EventFields, type Occurrence, type Scope, type
 import {
   addDays, browserTz, fmtTime, hueFor, isoDate, isoTime, layoutDay, minutesIntoDay, sameDay, startOfWeek,
 } from "../lib/dates";
+import { createRange, minutesToTime, resizeEdge, resizeResult } from "../lib/drag";
 import { EventDialog, type DialogState } from "./EventDialog";
 import { FindTimeDialog } from "./FindTimeDialog";
 
@@ -19,6 +20,24 @@ interface Menu {
   occ: Occurrence;
 }
 
+type Drag =
+  | { kind: "create"; day: Date; col: HTMLElement; anchor: number; start: number; end: number; moved: boolean }
+  | {
+      kind: "resize"; occ: Occurrence; day: Date; col: HTMLElement; edge: "top" | "bottom";
+      orig: { top: number; bottom: number }; top: number; bottom: number; moved: boolean;
+    };
+
+/** A finished resize of a recurring event, waiting for the user to choose a scope. */
+interface ScopePick {
+  x: number;
+  y: number;
+  occ: Occurrence;
+  start: string;
+  duration: number;
+}
+
+const gridMinutes = (col: HTMLElement, clientY: number) => (clientY - col.getBoundingClientRect().top) / PX_PER_MIN;
+
 export default function CalendarApp() {
   const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()));
   const [occs, setOccs] = useState<Occurrence[]>([]);
@@ -31,6 +50,10 @@ export default function CalendarApp() {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [now, setNow] = useState(() => new Date());
   const [tz, setTz] = useState("");
+  const [drag, setDrag] = useState<Drag | null>(null);
+  const [scopePick, setScopePick] = useState<ScopePick | null>(null);
+  const dragRef = useRef<Drag | null>(null);
+  const suppressClick = useRef(false);
   const scroller = useRef<HTMLDivElement>(null);
 
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
@@ -69,35 +92,130 @@ export default function CalendarApp() {
     return () => window.clearInterval(t);
   }, []);
   useEffect(() => {
-    const close = () => setMenu(null);
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && (setMenu(null), setDialog(null), setFindTime(false));
+    const close = () => {
+      if (suppressClick.current) return; // the click that ends a drag
+      setMenu(null);
+      setScopePick(null);
+      dragRef.current = null;
+      setDrag(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setMenu(null);
+      setDialog(null);
+      setFindTime(false);
+      setScopePick(null);
+      dragRef.current = null; // also aborts a drag in progress; pointerup then finds nothing
+      setDrag(null);
+    };
     window.addEventListener("click", close);
     window.addEventListener("keydown", onKey);
     return () => { window.removeEventListener("click", close); window.removeEventListener("keydown", onKey); };
   }, []);
 
-  const createAt = (day: Date, minutes = 9 * 60) => {
-    const snapped = Math.floor(minutes / 30) * 30;
+  const createAt = (day: Date, minutes = 9 * 60, duration?: number) => {
     const d = new Date(day);
-    d.setMinutes(snapped);
-    setDialog({ mode: "create", date: isoDate(day), time: isoTime(d), tz: browserTz() });
+    d.setMinutes(Math.floor(minutes / 15) * 15);
+    setDialog({ mode: "create", date: isoDate(day), time: isoTime(d), tz: browserTz(), duration });
   };
 
-  const onGridClick = (day: Date, e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.target !== e.currentTarget) return;
-    const y = e.clientY - e.currentTarget.getBoundingClientRect().top;
-    createAt(day, y / PX_PER_MIN);
+  const warnConflicts = (fresh: Conflict[], id: string) => {
+    const mine = fresh.filter((c) => c.a.event_id === id || c.b.event_id === id);
+    if (!mine.length) return;
+    const names = [...new Set(mine.map((c) => (c.a.event_id === id ? c.b : c.a).title))];
+    setNotice(`Saved, but it conflicts with ${names.map((n) => `"${n}"`).join(", ")} this week.`);
   };
 
   const save = async (fields: EventFields, scope: Scope) => {
     const saved = dialog?.mode === "edit" ? await api.edit(dialog.occ, scope, fields) : await api.create(fields);
-    const fresh = await reload();
-    const mine = fresh.filter((c) => c.a.event_id === saved.id || c.b.event_id === saved.id);
-    if (mine.length) {
-      const other = (c: Conflict) => (c.a.event_id === saved.id ? c.b : c.a).title;
-      const names = [...new Set(mine.map(other))];
-      setNotice(`Saved, but it conflicts with ${names.map((n) => `"${n}"`).join(", ")} this week.`);
+    warnConflicts(await reload(), saved.id);
+  };
+
+  // -- dragging ------------------------------------------------------------
+  // Listeners live on window for the life of one drag so the pointer can leave
+  // the element (or the column) without losing it; state mirrors into a ref so
+  // they always see the latest values.
+
+  const updateDrag = (next: Drag | null) => {
+    dragRef.current = next;
+    setDrag(next);
+  };
+
+  const beginDrag = (initial: Drag) => {
+    updateDrag(initial);
+    const move = (e: PointerEvent) => {
+      const cur = dragRef.current;
+      if (!cur) return;
+      const m = gridMinutes(cur.col, e.clientY);
+      if (cur.kind === "create") {
+        const [start, end] = createRange(cur.anchor, m);
+        updateDrag({ ...cur, start, end, moved: cur.moved || end - start > 15 });
+      } else {
+        const pos = resizeEdge(cur.edge, m, cur.top, cur.bottom);
+        const next = cur.edge === "top" ? { ...cur, top: pos } : { ...cur, bottom: pos };
+        updateDrag({ ...next, moved: next.top !== cur.orig.top || next.bottom !== cur.orig.bottom });
+      }
+    };
+    const stop = (e: PointerEvent) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      if (e.type === "pointercancel") updateDrag(null);
+      else finishDrag(e.clientX, e.clientY);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+  };
+
+  const finishDrag = (x: number, y: number) => {
+    const d = dragRef.current;
+    if (!d) return;
+    if (d.kind === "create") {
+      updateDrag(null);
+      // A click (no drag) gets the default hour; a drag gets exactly its range.
+      createAt(d.day, d.start, d.moved ? d.end - d.start : undefined);
+      return;
     }
+    if (!d.moved) {
+      updateDrag(null); // treat as a click on the event
+      return;
+    }
+    suppressClick.current = true;
+    window.setTimeout(() => { suppressClick.current = false; }, 0);
+    const { start, duration } = resizeResult(d.occ.local_start, d.occ.duration, d.orig, d);
+    if (d.occ.recurring) setScopePick({ x, y, occ: d.occ, start, duration }); // keep the preview up
+    else commitResize(d.occ, "this", start, duration);
+  };
+
+  const commitResize = async (occ: Occurrence, scope: Scope, start: string, duration: number) => {
+    setScopePick(null);
+    try {
+      const saved = await api.edit(occ, scope, { title: occ.title, start, duration, tz: occ.tz, rule: occ.rule });
+      warnConflicts(await reload(), saved.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      updateDrag(null);
+    }
+  };
+
+  const onColumnPointerDown = (day: Date, e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || e.target !== e.currentTarget || scopePick) return;
+    e.preventDefault();
+    const col = e.currentTarget;
+    const anchor = Math.floor(gridMinutes(col, e.clientY) / 15) * 15;
+    beginDrag({ kind: "create", day, col, anchor, start: anchor, end: anchor + 15, moved: false });
+  };
+
+  const onHandlePointerDown = (
+    occ: Occurrence, day: Date, edge: "top" | "bottom", top: number, bottom: number, e: React.PointerEvent,
+  ) => {
+    if (e.button !== 0 || scopePick) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const col = (e.currentTarget as HTMLElement).closest(".day-col") as HTMLElement;
+    beginDrag({ kind: "resize", occ, day, col, edge, orig: { top, bottom }, top, bottom, moved: false });
   };
 
   const pickSlot = (slot: Slot) => {
@@ -205,16 +323,28 @@ export default function CalendarApp() {
             ))}
           </div>
           {days.map((day) => (
-            <div key={day.toISOString()} className="day-col" onClick={(e) => onGridClick(day, e)}>
-              {layoutDay(occs, day).map(({ occ, top, height, col, cols, continues }) => {
-                const start = new Date(occ.start);
-                const end = new Date(occ.end);
+            <div
+              key={day.toISOString()}
+              className={`day-col ${drag ? "dragging" : ""}`}
+              onPointerDown={(e) => onColumnPointerDown(day, e)}
+            >
+              {layoutDay(occs, day).map((block) => {
+                const { occ, col, cols, continues, endsHere } = block;
+                const resizing = drag?.kind === "resize" && occKey(drag.occ) === occKey(occ) && sameDay(drag.day, day);
+                const top = resizing ? drag.top : block.top;
+                const height = resizing ? drag.bottom - drag.top : block.height;
+                const start = resizing
+                  ? new Date(new Date(occ.start).getTime() + (drag.top - drag.orig.top) * 60_000)
+                  : new Date(occ.start);
+                const end = resizing
+                  ? new Date(new Date(occ.end).getTime() + (drag.bottom - drag.orig.bottom) * 60_000)
+                  : new Date(occ.end);
                 const compact = height < 40;
                 const clash = conflicted.has(occKey(occ));
                 return (
                   <button
                     key={`${occ.event_id}|${occ.original_start}`}
-                    className={`event ${occ.modified ? "modified" : ""} ${compact ? "compact" : ""} ${clash ? "conflict" : ""}`}
+                    className={`event ${occ.modified ? "modified" : ""} ${compact ? "compact" : ""} ${clash ? "conflict" : ""} ${resizing ? "resizing" : ""}`}
                     style={{
                       top: top * PX_PER_MIN,
                       height: Math.max(height * PX_PER_MIN - 2, 18),
@@ -223,7 +353,12 @@ export default function CalendarApp() {
                       ["--hue" as string]: hueFor(occ.event_id),
                     }}
                     title={`${occ.title}\n${fmtTime(start)} – ${fmtTime(end)} (${occ.tz})`}
-                    onClick={(e) => { e.stopPropagation(); setMenu(null); setDialog({ mode: "edit", occ }); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (suppressClick.current || scopePick) return;
+                      setMenu(null);
+                      setDialog({ mode: "edit", occ });
+                    }}
                     onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, occ }); }}
                   >
                     <span className="ev-title">
@@ -232,12 +367,32 @@ export default function CalendarApp() {
                       {occ.title}
                     </span>
                     <span className="ev-time">
-                      {continues ? "… " : ""}{fmtTime(start)}{compact ? "" : ` – ${fmtTime(end)}`}
+                      {continues ? "… " : ""}{fmtTime(start)}{compact && !resizing ? "" : ` – ${fmtTime(end)}`}
                       {occ.modified && " · edited"}
                     </span>
+                    {!continues && (
+                      <span
+                        className="handle top"
+                        aria-label="Drag to change start"
+                        onPointerDown={(e) => onHandlePointerDown(occ, day, "top", block.top, block.top + block.height, e)}
+                      />
+                    )}
+                    {endsHere && (
+                      <span
+                        className="handle bottom"
+                        aria-label="Drag to change end"
+                        onPointerDown={(e) => onHandlePointerDown(occ, day, "bottom", block.top, block.top + block.height, e)}
+                      />
+                    )}
                   </button>
                 );
               })}
+              {drag?.kind === "create" && sameDay(drag.day, day) && (
+                <div className="ghost" style={{ top: drag.start * PX_PER_MIN, height: (drag.end - drag.start) * PX_PER_MIN }}>
+                  {fmtTime(new Date(`${isoDate(day)}T${minutesToTime(drag.start)}`))} –{" "}
+                  {drag.end >= 24 * 60 ? "12:00 AM" : fmtTime(new Date(`${isoDate(day)}T${minutesToTime(drag.end)}`))}
+                </div>
+              )}
               {sameDay(day, now) && <div className="now-line" style={{ top: minutesIntoDay(now) * PX_PER_MIN }} />}
             </div>
           ))}
@@ -258,6 +413,24 @@ export default function CalendarApp() {
           ) : (
             <li><button className="danger" onClick={() => { menuDelete("this"); setMenu(null); }}>Delete</button></li>
           )}
+        </ul>
+      )}
+
+      {scopePick && (
+        <ul
+          className="menu"
+          style={{ top: Math.min(scopePick.y, window.innerHeight - 190), left: Math.min(scopePick.x, window.innerWidth - 220) }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <li className="menu-label">Apply new time to</li>
+          {(["this", "following", "all"] as Scope[]).map((s) => (
+            <li key={s}>
+              <button onClick={() => commitResize(scopePick.occ, s, scopePick.start, scopePick.duration)}>
+                {s === "this" ? "This event" : s === "following" ? "This and following" : "All events"}
+              </button>
+            </li>
+          ))}
+          <li><button onClick={() => { setScopePick(null); updateDrag(null); }}>Cancel</button></li>
         </ul>
       )}
 

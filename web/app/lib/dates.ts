@@ -38,6 +38,7 @@ export interface Block {
   col: number;
   cols: number;
   continues: boolean; // started on a previous day
+  endsHere: boolean; // false when clipped at midnight
 }
 
 /** Clip occurrences to one day and lay out overlapping ones side by side. */
@@ -53,7 +54,7 @@ export function layoutDay(occs: Occurrence[], day: Date): Block[] {
       const ce = Math.min(e, dayEnd);
       const top = cs === dayStart ? 0 : minutesIntoDay(new Date(cs));
       const bottom = ce === dayEnd ? 24 * 60 : minutesIntoDay(new Date(ce));
-      return { occ, top, height: bottom - top, s: cs, e: ce, continues: s < dayStart };
+      return { occ, top, height: bottom - top, s: cs, e: ce, continues: s < dayStart, endsHere: e <= dayEnd };
     })
     .filter((x): x is NonNullable<typeof x> => x !== null)
     .sort((a, b) => a.s - b.s || b.e - a.e);
@@ -72,7 +73,10 @@ export function layoutDay(occs: Occurrence[], day: Date): Block[] {
     const used = new Set(cluster.filter((b) => b.e > seg.s).map((b) => b.col));
     let col = 0;
     while (used.has(col)) col++;
-    cluster.push({ occ: seg.occ, top: seg.top, height: seg.height, col, cols: 1, continues: seg.continues, e: seg.e });
+    cluster.push({
+      occ: seg.occ, top: seg.top, height: seg.height, col, cols: 1,
+      continues: seg.continues, endsHere: seg.endsHere, e: seg.e,
+    });
     clusterEnd = Math.max(clusterEnd, seg.e);
   }
   if (cluster.length) flush();

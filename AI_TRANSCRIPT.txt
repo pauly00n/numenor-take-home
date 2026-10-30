@@ -1,0 +1,3312 @@
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   ~/Projects/numenor-take-home
+
+
+❯ read TASK.md. the current data model im assumign will be the best for this is 
+  Event(id, title, start, duration, tz, rule=None), keeping freq, int(erval),   
+  byweekday (which days), until/count for how many or until. how should we      
+  handle exceptions? cancels and overrides separately (which take precedence    
+  over the existing recurring events?) i believe a lightweight calendar gui     
+  (nextjs local app) would work best for observability and use (simple week by  
+  week layout for now, scrollable up/down with time in day as a row, day as a   
+  column, button to create new events with the necessary fields, right click    
+  existing events to modify fields). we can't use schedulign libraries so       
+  simply datetime + zoneinfo would be fine. pytest or whichever unittest of     
+  your discretion to make sure events/commands to initialize them are owrking   
+  as planned.                                                                   
+
+  Listed 1 directory (ctrl+o to expand)
+
+⏺ i read TASK.md. your model is mostly right. a few pushbacks, then my answer on
+  exceptions.
+
+  data model
+
+  Event(id, title, start, duration, tz, rule=None) works, with these changes:
+
+  - store start as local wall-clock time plus tz, not UTC. expand the rule in
+    local time and attach the zone at the end. if you expand in UTC, a 9am
+    weekly meeting drifts to 8am or 10am across DST. you also have to decide
+    what happens to a 2:30am occurrence on spring-forward day (it doesn't exist)
+    and fall-back day (it happens twice). i'd let zoneinfo's default fold=0
+    handle both and write it down in the README.
+  - rule: freq (DAILY | WEEKLY, maybe MONTHLY), interval, byweekday, and until
+    or count, never both. three semantics need pinning down:
+    - count: counts generated occurrences before exceptions are applied. this is
+      RFC 5545 behavior: cancel #3 of 10 and you get 9, not 10.
+    - until: inclusive, compared in the event's tz.
+    - weekly interval: counts weeks from the start date's week, with weeks
+      starting monday. if the start date isn't one of the byweekday days, i'd
+      skip it (RFC says it still counts). pick one and document it.
+  - MONTHLY opens day-31 and feb-29 edge cases. either cut it or define "skip
+    months where the day doesn't exist."
+
+  exceptions: one table, not two
+
+  i'd push back on keeping cancels and overrides separate. two tables is exactly
+  what creates your precedence question: what happens when both exist for the
+  same occurrence? with one table that can't happen:
+
+  Exception(event_id, original_start, cancelled: bool,
+            start=None, duration=None, title=None)   # patch fields
+
+  - key it on original_start (RFC calls this RECURRENCE-ID), not on the
+    occurrence's index. an index shifts whenever the rule changes. a date
+    doesn't.
+  - precedence: an exception always replaces the occurrence it's keyed to.
+    cancel is just cancelled=True. there's one record per key, so nothing can
+    conflict.
+  - expanding a query window [a, b):
+    a. generate occurrences, starting the window early by duration so events
+       already running at a still show
+    b. drop any occurrence that has an exception
+    c. add overrides whose new time falls in the window, wherever the original
+       was. otherwise an occurrence moved from next week into this week never
+       shows up.
+  - orphans: if the rule is edited and an exception's original_start no longer
+    gets generated, ignore it at expansion and delete it when the rule is saved.
+  - edit scopes: offer "this event" (write an exception), "this and following"
+    (set until on the old series and fork a new event at that date), and "all"
+    (edit the base event). the split costs maybe 15 lines and it's what real
+    calendars do.
+  - cancel the whole series = delete the event and its exceptions.
+
+  architecture pushback
+
+  next.js + a python core means two languages, two processes, CORS, and an API
+  contract, all inside a 60 minute budget. you need python because zoneinfo is
+  far better than JS Date/Intl without a library. my recommendation: FastAPI
+  serving the core over JSON, with a single static page (vanilla JS or React via
+  CDN) for the week grid. it's the same UX for a fraction of the setup. if
+  you're fast in next.js, it's defensible, but it's where the time will go.
+
+  GUI notes:
+  - right-click on a recurring occurrence has to ask "this / following / all".
+    also make plain click open the edit form, because nobody discovers
+    right-click.
+  - pick one display tz (the browser's) and convert each event from its own tz
+    into it.
+
+  extension
+
+  the week view might not count as the "full GUI" extension, since a view is
+  already a core requirement. conflict detection is nearly free once expansion
+  exists: sort the expanded occurrences in the window, sweep for overlaps, and
+  explain each overlap ("standup overlaps 1:1, 9:15-9:30"). you can show it in
+  the grid too. i'd do that as the extension.
+
+  storage and tests
+
+  - storage: a JSON file, or stdlib sqlite3. JSON is enough here.
+  - tests: pytest. the cases that matter:
+    - DST on both transitions
+    - weekly MWF every 2 weeks
+    - count with a cancelled occurrence
+    - inclusive until
+    - an override moved into and out of the window
+    - orphaned exceptions after a rule edit
+    - the this-and-following split
+    - an event crossing the window boundary
+    - conflict sweep
+
+  want me to start on the core (models, expansion, exceptions, conflicts, tests)
+  first, then the API and UI? if you're set on next.js, say so before i
+  scaffold.
+
+✻ Churned for 39s · done Thursday 5:23 PM
+
+❯ the local wall-clock time plus tz sounds good, with good reason. write        
+  zoneinfo's default on the readme to handle that exception. until is better    
+  than count. weekly interval: simply every 7 days. define skip months wehre    
+  the day doesn't exist. one exceptions table sounds good, keyed on             
+  original_start, since we're handling a calendar with only one event per time  
+  slot. anything else before we start?                                          
+
+⏺ a few things before we start:
+
+  1. "one event per time slot" doesn't fit with the key. the key has to be
+     (event_id, original_start), not original_start alone. two different series
+     can both have an occurrence at 9am monday, and an exception on one
+     shouldn't touch the other. if you actually mean the calendar forbids 
+     overlapping events, that's a much bigger rule: create and edit have to
+     reject overlaps, and that kills conflict detection as the extension. i'd
+     allow overlaps and flag them.
+  2. "every 7 days" vs byweekday. do you mean:
+     - (a) WEEKLY just repeats on the start's weekday every 7 * interval days,
+       and byweekday is dropped, or
+     - (b) byweekday stays (e.g. MWF), and each listed day repeats every 7 * 
+       interval days, counted from the start's week?
+
+     (b) costs maybe 5 more lines and gets you "MWF standup," which is the most
+     common real recurrence. i'd go (b).
+  3. until as a date, not a datetime. "through dec 15" is inclusive of that
+     whole day in the event's tz. that's simpler and matches how people think
+     about it. dropping count is fine.
+  4. stack is still open. FastAPI plus a static page, or next.js? this is the
+     biggest time lever.
+  5. edit scopes. do you want this / this-and-following / all? or just this /
+     all to save time? the split is cheap, but it's another dialog in the UI.
+  6. extension. is conflict detection confirmed?
+  7. storage: i'll assume a JSON file unless you say otherwise.
+
+  answer 2, 4, 5, and 6 and i'll scaffold.
+
+✻ Baked for 11s · done Thursday 5:32 PM
+
+❯ allow + flag overlaps sounds good. byweekday only is better since it replaces 
+  weekly with redundancy (simply M or W if you want just weekly on              
+  monday/weds). until as a date yes. i think you can crank a next.js page super 
+  quickly (i want to do most of the extensions, but start with just that one).  
+  no extensions yet. storage json yes good.                                     
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I'm building the backend first, keying events on (event_id, original_start) so
+  overlaps can be flagged. Settled choices: byweekday only, inclusive until
+  dates, monthly skipping months without the day, Python core with FastAPI and
+  Next.js on JSON storage, no extensions, and all three edit scopes included.
+
+⏺ Bash(mkdir -p /Users/paulyoon/Projects/numenor-take-home/backend/calcore
+      /Users/paulyoon/Projects/numenor-take-home/backend/tests && cd
+      /Users/paulyoon/Projects/nume…)
+  ⎿   + typing-extensions==4.16.0
+      + typing-inspection==0.4.4
+      + uvicorn==0.54.0
+  ⎿  Created backend/pyproject.toml (+21 -0)
+       1 +[project]                                                      
+       2 +name = "calcore"                                               
+       3 +version = "0.1.0"                                              
+       4 +requires-python = ">=3.12"                                     
+       5 +dependencies = [                                               
+       6 +    "fastapi>=0.115",                                          
+       7 +    "uvicorn>=0.30",                                           
+       8 +]                                                              
+       9 +                                                               
+      10 +[dependency-groups]                                            
+      11 +dev = [                                                        
+      12 +    "pytest>=8",                                               
+      13 +    "httpx>=0.27",                                             
+      14 +]                                                              
+      15 +                                                               
+      16 +[tool.pytest.ini_options]                                      
+      17 +testpaths = ["tests"]                                          
+      18 +pythonpath = ["."]                                             
+      19 +                                                               
+      20 +[tool.uv]                                                      
+      21 +package = false                                                
+  ⎿  Created backend/uv.lock (+383 -0)
+        1 +version = 1                                                   
+        2 +revision = 3                                                  
+        3 +requires-python = ">=3.12"                                    
+        4 +                                                              
+        5 +[[package]]                                                   
+        6 +name = "annotated-doc"                                        
+        7 +version = "0.0.5"                                             
+        8 +source = { registry = "https://pypi.org/simple" }             
+        9 +sdist = { url = "https://files.pythonhosted.org/packages/5a/8e
+          +/38aa427ed5402449e226975b649c5dc73ccadfefeb95e6aecb8f8ea4b6b6/
+          +annotated_doc-0.0.5.tar.gz", hash = "sha256:c7e58ce09192557605
+          +d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb", size = 10758,
+          + upload-time = "2026-07-28T13:50:58.129Z" }                   
+       10 +wheels = [                                                    
+       11 +    { url = "https://files.pythonhosted.org/packages/3e/30/e90
+          +0b21425a860e195f32e37657aa1f7c7f2b1bfb26f03ca209b90933c06/anno
+          +tated_doc-0.0.5-py3-none-any.whl", hash = "sha256:117bac03a25e
+          +de5df5440e855b32d556049ca169ead221505badf432fed4b101", size = 
+          +5302, upload-time = "2026-07-28T13:50:57.239Z" },             
+       12 +]                                                             
+       13 +                                                              
+       14 +[[package]]                                                   
+       15 +name = "annotated-types"                                      
+       16 +version = "0.8.0"                                             
+       17 +source = { registry = "https://pypi.org/simple" }             
+       18 +sdist = { url = "https://files.pythonhosted.org/packages/5f/56
+          +/a8120250d128bed162cd73c76d45f6ef9991f3e068f62a8ee060afa3104a/
+          +annotated_types-0.8.0.tar.gz", hash = "sha256:13b2beaad985e05e
+          +2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7", size = 1589
+          +3, upload-time = "2026-07-23T20:16:13.995Z" }                 
+       19 +wheels = [                                                    
+       20 +    { url = "https://files.pythonhosted.org/packages/99/91/8ac
+          +ff4f5e50511b911bbccb72b8628a49c68ce14148cd9f6431094859a90/anno
+          +tated_types-0.8.0-py3-none-any.whl", hash = "sha256:f072f4d804
+          +ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0", size 
+          += 13427, upload-time = "2026-07-23T20:16:12.938Z" },          
+       21 +]                                                             
+       22 +                                                              
+       23 +[[package]]                                                   
+       24 +name = "anyio"                                                
+       25 +version = "4.15.1"                                            
+       26 +source = { registry = "https://pypi.org/simple" }             
+       27 +dependencies = [                                              
+       28 +    { name = "idna" },                                        
+       29 +    { name = "typing-extensions", marker = "python_full_versio
+          +n < '3.15'" },                                                
+       30 +]                                                             
+       31 +sdist = { url = "https://files.pythonhosted.org/packages/a9/d2
+          +/f4d173e22df740bc37b1db102b386ba719b66e95b0f0d751f556b387e6d2/
+          +anyio-4.15.1.tar.gz", hash = "sha256:9f28306018cbd6d329e64a36d
+          +58256edff76dd996fe423bc957326e578b82a94", size = 276966, uploa
+          +d-time = "2026-09-05T10:42:39.44Z" }                          
+       32 +wheels = [                                                    
+       33 +    { url = "https://files.pythonhosted.org/packages/12/b8/4bd
+          +346e22b28902df4d651910f5242c28d84e4a5c2435ca5c3f797ed7e2e/anyi
+          +o-4.15.1-py3-none-any.whl", hash = "sha256:6152fdbbf9a77fdec97
+          +731721bebf7c4c44f7c29b424b0065826173efc7ed101", size = 132079,
+          + upload-time = "2026-09-05T10:42:37.923Z" },                  
+       34 +]                                                             
+       35 +                                                              
+       36 +[[package]]                                                   
+       37 +name = "calcore"                                              
+       38 +version = "0.1.0"                                             
+       39 +source = { virtual = "." }                                    
+       40 +dependencies = [                                              
+     … 343 more lines (ctrl+o to expand)
+
+⏺ Write(backend/calcore/models.py)
+  ⎿  Wrote 113 lines to backend/calcore/models.py
+       1 from __future__ import annotations
+       2 
+       3 from dataclasses import dataclass
+       4 from datetime import date, datetime, timedelta
+       5 from enum import StrEnum
+       6 from zoneinfo import ZoneInfo
+       7 
+       8 
+       9 class Freq(StrEnum):
+      10     WEEKLY = "WEEKLY"
+     … +103 lines (ctrl+o to expand)
+
+⏺ Write(backend/calcore/recurrence.py)
+  ⎿  Wrote 134 lines to backend/calcore/recurrence.py
+      1 from __future__ import annotations
+      2 
+      3 from collections.abc import Iterator, Mapping
+      4 from datetime import UTC, date, datetime, timedelta, tzinfo
+      5 
+      6 from .models import Event, EventException, Freq, Occurrence
+      7 
+      8 _DAY = timedelta(days=1)
+      9 
+     … +125 lines (ctrl+o to expand)
+
+⏺ Write(backend/calcore/store.py)
+  ⎿  Wrote 106 lines to backend/calcore/store.py
+       1 from __future__ import annotations
+       2 
+       3 import json
+       4 import os
+       5 import tempfile
+       6 from datetime import date, datetime, timedelta
+       7 from pathlib import Path
+       8 from typing import Any
+       9 
+      10 from .models import Event, EventException, Rule
+     … +96 lines (ctrl+o to expand)
+
+⏺ Write(backend/calcore/service.py)
+  ⎿  Wrote 185 lines to backend/calcore/service.py
+       1 from __future__ import annotations
+       2 
+       3 import uuid
+       4 from dataclasses import replace
+       5 from datetime import datetime, timedelta
+       6 from typing import Any
+       7 
+       8 from .models import Event, EventException, Occurrence, Rule, Sco
+         pe
+       9 from .recurrence import expand, is_occurrence
+     … +176 lines (ctrl+o to expand)
+
+⏺ small fixes: make edits atomic (a split followed by a failed edit shouldn't
+  leave half-applied state), and turn bad tz into a ValueError so it doesn't
+  read as a 404.
+
+⏺ Bash(python3 - <<'EOF'
+      import re…)
+  ⎿  Created backend/calcore/__init__.py (+0 -0)
+  ⎿  Updated backend/calcore/models.py (+4 -1)
+      69              raise ValueError("start must be a naive wall-clock 
+          time; put the zone in tz")
+      70          if self.duration <= timedelta(0):
+      71              raise ValueError("duration must be positive")
+      72 -        ZoneInfo(self.tz)  # raises ZoneInfoNotFoundError (a Ke
+         -yError) for bad zones                                          
+      72 +        try:                                                   
+      73 +            ZoneInfo(self.tz)                                  
+      74 +        except (KeyError, ValueError):                         
+      75 +            raise ValueError(f"unknown time zone {self.tz!r}") 
+         +from None                                                      
+      76          if self.rule and self.rule.until and self.rule.until < 
+          self.start.date():
+      77              raise ValueError("until is before the event starts"
+          )
+      78  
+  ⎿  Updated backend/calcore/service.py (+37 -25)
+      1  from __future__ import annotations
+      2  
+      3  import uuid
+      4 +from collections.abc import Iterator                            
+      5 +from contextlib import contextmanager                           
+      6  from dataclasses import replace
+      7  from datetime import datetime, timedelta
+      8  from typing import Any
+     ...
+      69          self, title: str, start: datetime, duration: timedelta,
+           tz: str, rule: Rule | None = None
+      70      ) -> Event:
+      71          event = Event(_new_id(), title, start, duration, tz, ru
+          le)
+      70 -        self.events[event.id] = event                          
+      71 -        self.exceptions[event.id] = {}                         
+      72 -        self._save()                                           
+      72 +        with self._transaction():                              
+      73 +            self.events[event.id] = event                      
+      74 +            self.exceptions[event.id] = {}                     
+      75          return event
+      76  
+      77      def edit(self, event_id: str, original_start: datetime, sco
+          pe: Scope, **changes: Any) -> Event:
+     ...
+       90          if unknown:
+       91              raise ValueError(f"cannot change {sorted(unknown)}
+            with scope {scope.value!r}")
+       92  
+       91 -        if event.rule is None or scope is Scope.ALL:          
+       92 -            result = self._edit_series(event, original_start, 
+          -changes)                                                      
+       93 -        elif scope is Scope.THIS:                             
+       94 -            result = self._edit_one(event, original_start, cha
+          -nges)                                                         
+       95 -        elif original_start.date() <= event.start.date():  # f
+          -irst occurrence: whole series                                 
+       96 -            result = self._edit_series(event, original_start, 
+          -changes)                                                      
+       97 -        else:                                                 
+       93 +        with self._transaction():                             
+       94 +            if event.rule is None or scope is Scope.ALL:      
+       95 +                return self._edit_series(event, original_start
+          +, changes)                                                    
+       96 +            if scope is Scope.THIS:                           
+       97 +                return self._edit_one(event, original_start, c
+          +hanges)                                                       
+       98 +            if original_start.date() <= event.start.date():  #
+          + first occurrence: whole series                               
+       99 +                return self._edit_series(event, original_start
+          +, changes)                                                    
+      100              tail = self._split(event, original_start)
+       99 -            result = self._edit_series(tail, original_start, c
+          -hanges)                                                       
+      100 -        self._save()                                          
+     … 53 more lines (ctrl+o to expand)
+
+⏺ Write(backend/api.py)
+  ⎿  Wrote 120 lines to backend/api.py
+      1 from __future__ import annotations
+      2 
+      3 import os
+      4 from datetime import date, datetime, timedelta
+      5 from typing import Any
+      6 
+      7 from fastapi import FastAPI, Request
+      8 from fastapi.responses import JSONResponse
+      9 from pydantic import BaseModel, Field
+     … +111 lines (ctrl+o to expand)
+
+⏺ now the tests.
+
+⏺ Write(backend/tests/test_recurrence.py)
+  ⎿  Wrote 189 lines to backend/tests/test_recurrence.py
+       1 from datetime import UTC, date, datetime, timedelta
+       2 from zoneinfo import ZoneInfo
+       3 
+       4 import pytest
+       5 
+       6 from calcore.models import Event, EventException, Freq, Rule
+       7 from calcore.recurrence import expand, is_occurrence
+       8 
+       9 NY = ZoneInfo("America/New_York")
+      10 HOUR = timedelta(hours=1)
+     … +179 lines (ctrl+o to expand)
+
+⏺ Write(backend/tests/test_service.py)
+  ⎿  Wrote 193 lines to backend/tests/test_service.py
+       1 from datetime import date, datetime, timedelta
+       2 from zoneinfo import ZoneInfo
+       3 
+       4 import pytest
+       5 
+       6 from calcore.models import Freq, Rule, Scope
+       7 from calcore.service import Calendar, NotFound
+       8 from calcore.store import JsonStore
+       9 
+      10 NY = ZoneInfo("America/New_York")
+     … +183 lines (ctrl+o to expand)
+
+⏺ Write(backend/tests/test_api.py)
+  ⎿  Wrote 64 lines to backend/tests/test_api.py
+      1 import pytest
+      2 from fastapi.testclient import TestClient
+      3 
+      4 from api import create_app
+      5 from calcore.service import Calendar
+      6 from calcore.store import JsonStore
+      7 
+      8 WEEK = {"start": "2026-11-02T00:00:00-05:00", "end": "2026-11-09T
+        00:00:00-05:00"}
+      9 
+     … +55 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ 54/54 pass on the first run, which makes me a little wary. but every test
+  asserts concrete values (days, UTC hours, offsets), so they aren't vacuous. on
+  to the next.js UI.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Bash(cat > next.config.mjs <<'EOF'
+      const API = process.env.CALENDAR_API ?? "http://127.0.0.1:8000";…)
+  ⎿  Updated .gitignore (+5 -0)
+       3  *.pyc
+       4  .pytest_cache/
+       5  .DS_Store
+       6 +node_modules/                                                  
+       7 +.next/                                                         
+       8 +next-env.d.ts                                                  
+       9 +*.tsbuildinfo                                                  
+      10 +backend/data/                                                  
+  ⎿  Created web/next.config.mjs (+8 -0)
+      1 +const API = process.env.CALENDAR_API ?? "http://127.0.0.1:8000";
+      2 +                                                                
+      3 +/** @type {import('next').NextConfig} */                        
+      4 +export default {                                                
+      5 +  async rewrites() {                                            
+      6 +    return [{ source: "/api/:path*", destination: `${API}/api/:p
+        +ath*` }];                                                       
+      7 +  },                                                            
+      8 +};                                                              
+  ⎿  Created web/tsconfig.json (+21 -0)
+       1 +{                                                              
+       2 +  "compilerOptions": {                                         
+       3 +    "target": "ES2022",                                        
+       4 +    "lib": ["dom", "dom.iterable", "esnext"],                  
+       5 +    "allowJs": false,                                          
+       6 +    "skipLibCheck": true,                                      
+       7 +    "strict": true,                                            
+       8 +    "noEmit": true,                                            
+       9 +    "esModuleInterop": true,                                   
+      10 +    "module": "esnext",                                        
+      11 +    "moduleResolution": "bundler",                             
+      12 +    "resolveJsonModule": true,                                 
+      13 +    "isolatedModules": true,                                   
+      14 +    "jsx": "preserve",                                         
+      15 +    "incremental": true,                                       
+      16 +    "plugins": [{ "name": "next" }],                           
+      17 +    "paths": { "@/*": ["./*"] }                                
+      18 +  },                                                           
+      19 +  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/ty
+         +pes/**/*.ts"],                                                 
+      20 +  "exclude": ["node_modules"]                                  
+      21 +}                                                              
+
+⏺ Write(web/app/lib/api.ts)  ⎿  Wrote 68 lines to web/app/lib/api.ts
+      1 export type Freq = "WEEKLY" | "MONTHLY";
+      2 export type Scope = "this" | "following" | "all";
+      3 
+      4 export interface Rule {
+      5   freq: Freq;
+      6   interval: number;
+      7   byweekday: number[]; // 0=Mon..6=Sun
+      8   until: string | null; // YYYY-MM-DD, inclusive
+      9 }
+     … +59 lines (ctrl+o to expand)
+
+⏺ Write(web/app/lib/dates.ts)
+  ⎿  Wrote 87 lines to web/app/lib/dates.ts
+      1 import type { Occurrence } from "./api";
+      2 
+      3 export const browserTz = () => Intl.DateTimeFormat().resolvedOpti
+        ons().timeZone;
+      4 
+      5 export function startOfWeek(d: Date): Date {
+      6   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      7   x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); // Monday
+      8   return x;
+      9 }
+     … +78 lines (ctrl+o to expand)
+
+⏺ Write(web/app/components/EventDialog.tsx)
+  ⎿  Wrote 163 lines to web/app/components/EventDialog.tsx
+       1 "use client";
+       2 
+       3 import { useMemo, useState } from "react";
+       4 import type { EventFields, Freq, Occurrence, Rule, Scope } from 
+         "../lib/api";
+       5 import { weekdayOf } from "../lib/dates";
+       6 
+       7 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun
+         "];
+       8 
+     … +155 lines (ctrl+o to expand)
+
+⏺ Bash(sed -i '' 's/\[interval, setInterval\]/[interval, setRuleInterval]/;
+      s/setInterval(Number/setRuleInterval(Number/'
+      app/components/EventDialog.tsx && grep -n "Ru…)
+  ⎿  2 matches in 1F:
+
+     [file] app/components/EventDialog.tsx (2):
+     … +3 lines (ctrl+o to expand)
+  ⎿  Updated web/app/components/EventDialog.tsx (+2 -2)
+      29    const [duration, setDuration] = useState(occ?.duration ?? 60)
+          ;
+      30    const [tz, setTz] = useState(init.tz);
+      31    const [repeat, setRepeat] = useState<"none" | Freq>(occ?.rule
+          ?.freq ?? "none");
+      32 -  const [interval, setInterval] = useState(occ?.rule?.interval 
+         -?? 1);                                                         
+      32 +  const [interval, setRuleInterval] = useState(occ?.rule?.inter
+         +val ?? 1);                                                     
+      33    const [byweekday, setByweekday] = useState<number[]>(
+      34      occ?.rule?.byweekday.length ? occ.rule.byweekday : [weekday
+          Of(init.date || "2026-01-05")],
+      35    );
+     ...
+      121                <label className="inline">
+      122                  every
+      123                  <input type="number" min={1} className="narrow
+           " value={interval}
+      124 -                  onChange={(e) => setInterval(Number(e.target
+          -.value))} />                                                  
+      124 +                  onChange={(e) => setRuleInterval(Number(e.ta
+          +rget.value))} />                                              
+      125                  {repeat === "WEEKLY" ? "week(s)" : "month(s)"}
+      126                </label>
+      127              )}
+
+⏺ Write(web/app/page.tsx)
+  ⎿  Wrote 188 lines to web/app/page.tsx
+       1 "use client";
+       2 
+       3 import { useCallback, useEffect, useMemo, useRef, useState } fro
+         m "react";
+       4 import { api, type EventFields, type Occurrence, type Scope } fr
+         om "./lib/api";
+       5 import {
+       6   addDays, browserTz, fmtTime, hueFor, isoDate, isoTime, layoutD
+         ay, minutesIntoDay, sameDay, startOfWeek,
+       7 } from "./lib/dates";
+     … +181 lines (ctrl+o to expand)
+
+⏺ simplifying the default-day logic for the new-event button:
+
+⏺ Bash(python3 - <<'EOF'
+      p='app/page.tsx'; s=open(p).read()…)
+  ⎿  Updated web/app/page.tsx (+1 -1)
+       94            <span className="week-label">{weekLabel}</span>
+       95          </div>
+       96          <span className="tz-note">Times in {tz}</span>
+       97 -        <button className="primary" onClick={() => createAt(sa
+          -meDay(now, days[0]) || now < days[0] || now > days[6] ? days[0
+          -] : new Date(now.getFullYear(), now.getMonth(), now.getDate())
+          -)}>                                                           
+       97 +        <button className="primary" onClick={() => createAt(da
+          +ys.find((d) => sameDay(d, now)) ?? days[0])}>                 
+       98            + New event
+       99          </button>
+      100        </header>
+
+⏺ Write(web/app/layout.tsx)
+  ⎿  Wrote 12 lines to web/app/layout.tsx
+       1 import type { Metadata } from "next";
+       2 import "./globals.css";
+       3 
+       4 export const metadata: Metadata = { title: "Calendar" };
+       5 
+       6 export default function RootLayout({ children }: { children: Rea
+         ct.ReactNode }) {
+       7   return (
+       8     <html lang="en">
+       9       <body>{children}</body>
+     … +3 lines (ctrl+o to expand)
+
+⏺ Write(web/app/globals.css)
+  ⎿  Wrote 160 lines to web/app/globals.css
+       1 :root {
+       2   --bg: #fbfaf8;
+       3   --surface: #ffffff;
+       4   --text: #1d1c1a;
+       5   --muted: #77736c;
+       6   --line: #ebe8e3;
+       7   --line-strong: #dcd8d1;
+       8   --accent: #2f5bd3;
+       9   --accent-text: #ffffff;
+      10   --danger: #c2362b;
+     … +150 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ build is clean. starting both servers and seeding some demo data:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ proxy works. adding a seed script so there's demo data relative to the current
+  week:
+
+⏺ Write(backend/seed.py)
+  ⎿  Wrote 49 lines to backend/seed.py
+       1 """Populate the calendar with demo events around the current wee
+         k.
+       2 
+       3     uv run python seed.py [--reset]
+       4 """
+       5 
+       6 from __future__ import annotations
+       7 
+       8 import os
+       9 import sys
+     … +40 lines (ctrl+o to expand)
+
+⏺ the API keeps state in memory, so i'll seed and then restart it:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ curl here is wrapped by something that prints a schema summary instead of the
+  body. using python to fetch:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ the data checks out: wednesday's standup is cancelled, friday's is moved, the
+  nov 1 "rent due" lands after DST at -05:00, and the late deploy crosses
+  midnight. now a visual check in the browser.
+
+⏺ Skill(yab-browser)
+  ⎿  Successfully loaded skill
+
+  Called yab-browser 2 times, ran 2 shell commands (ctrl+o to expand)
+
+⏺ yab won't open localhost, so i'm taking a headless chrome screenshot instead.
+
+  Searched for 1 pattern, listed 1 directory, ran 2 shell commands (ctrl+o to expand)
+
+⏺ i'll drive it with playwright so i can test clicks and right-clicks too, not
+  just take a static screenshot.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Everything runs end to end, but there's one real bug: the server and client
+  render the date differently because the page depends on timezone. I'll make
+  the page client-only and check the screenshots first.
+
+  Read 3 files (ctrl+o to expand)
+
+⏺ Three issues came up in the screenshots: short events lose their titles to a
+  flexbox overflow bug, 15-minute standups are too cramped to read, and there's
+  the earlier hydration mismatch. The "gym" showing only on Thursday is
+  expected, since the form defaults to the start date's weekday and the Monday I
+  toggled falls before the start.
+
+⏺ Bash(cd /Users/paulyoon/Projects/numenor-take-home/web && python3 - <<'EOF'
+      p='app/globals.css'; s=open(p).read()…)
+  ⎿  56:      return { occ, top, height: bottom - top, s: cs, e: ce, contin
+     ues: s < dayStart };
+  ⎿  Created web/app/components/CalendarApp.tsx (+187 -0)
+        1 +"use client";                                                 
+        2 +                                                              
+        3 +import { useCallback, useEffect, useMemo, useRef, useState } f
+          +rom "react";                                                  
+        4 +import { api, type EventFields, type Occurrence, type Scope } 
+          +from "../lib/api";                                            
+        5 +import {                                                      
+        6 +  addDays, browserTz, fmtTime, hueFor, isoDate, isoTime, layou
+          +tDay, minutesIntoDay, sameDay, startOfWeek,                   
+        7 +} from "../lib/dates";                                        
+        8 +import { EventDialog, type DialogState } from "./EventDialog";
+        9 +                                                              
+       10 +const HOUR_PX = 48;                                           
+       11 +const PX_PER_MIN = HOUR_PX / 60;                              
+       12 +                                                              
+       13 +interface Menu {                                              
+       14 +  x: number;                                                  
+       15 +  y: number;                                                  
+       16 +  occ: Occurrence;                                            
+       17 +}                                                             
+       18 +                                                              
+       19 +export default function CalendarApp() {                       
+       20 +  const [weekStart, setWeekStart] = useState(() => startOfWeek
+          +(new Date()));                                                
+       21 +  const [occs, setOccs] = useState<Occurrence[]>([]);         
+       22 +  const [error, setError] = useState<string | null>(null);    
+       23 +  const [dialog, setDialog] = useState<DialogState | null>(nul
+          +l);                                                           
+       24 +  const [menu, setMenu] = useState<Menu | null>(null);        
+       25 +  const [now, setNow] = useState(() => new Date());           
+       26 +  const [tz, setTz] = useState("");                           
+       27 +  const scroller = useRef<HTMLDivElement>(null);              
+       28 +                                                              
+       29 +  const days = useMemo(() => Array.from({ length: 7 }, (_, i) 
+          +=> addDays(weekStart, i)), [weekStart]);                      
+       30 +                                                              
+       31 +  const reload = useCallback(async () => {                    
+       32 +    try {                                                     
+       33 +      setOccs(await api.occurrences(weekStart, addDays(weekSta
+          +rt, 7)));                                                     
+       34 +      setError(null);                                         
+       35 +    } catch (e) {                                             
+       36 +      setError(`Could not load events: ${e instanceof Error ? 
+          +e.message : e}. Is the API running on :8000?`);               
+       37 +    }                                                         
+       38 +  }, [weekStart]);                                            
+       39 +                                                              
+       40 +  useEffect(() => { reload(); }, [reload]);                   
+     … 147 more lines (ctrl+o to expand)
+  ⎿  Updated web/app/globals.css (+2 -0)
+      105  }
+      106  .event:hover { filter: brightness(0.97); z-index: 2; }
+      107  .event.modified { border-left-style: dashed; }
+      108 +.event > span { flex-shrink: 0; }                             
+      109 +.event.compact { flex-direction: row; align-items: center; gap
+          +: 6px; padding-block: 0; }                                    
+      110  .ev-title { font-weight: 600; white-space: nowrap; overflow: h
+           idden; text-overflow: ellipsis; }
+      111  .ev-icon { margin-right: 4px; opacity: 0.7; font-weight: 400; 
+           }
+      112  .ev-time { opacity: 0.8; font-variant-numeric: tabular-nums; w
+           hite-space: nowrap; }
+  ⎿  Updated web/app/lib/dates.ts (+1 -1)
+      53        const ce = Math.min(e, dayEnd);
+      54        const top = cs === dayStart ? 0 : minutesIntoDay(new Date
+          (cs));
+      55        const bottom = ce === dayEnd ? 24 * 60 : minutesIntoDay(n
+          ew Date(ce));
+      56 -      return { occ, top, height: Math.max(bottom - top, 15), s:
+         - cs, e: ce, continues: s < dayStart };                         
+      56 +      return { occ, top, height: bottom - top, s: cs, e: ce, co
+         +ntinues: s < dayStart };                                       
+      57      })
+      58      .filter((x): x is NonNullable<typeof x> => x !== null)
+      59      .sort((a, b) => a.s - b.s || b.e - a.e);
+  ⎿  Updated web/app/page.tsx (+5 -182)
+        1  "use client";
+        2  
+        3 -import { useCallback, useEffect, useMemo, useRef, useState } f
+          -rom "react";                                                  
+        4 -import { api, type EventFields, type Occurrence, type Scope } 
+          -from "./lib/api";                                             
+        5 -import {                                                      
+        6 -  addDays, browserTz, fmtTime, hueFor, isoDate, isoTime, layou
+          -tDay, minutesIntoDay, sameDay, startOfWeek,                   
+        7 -} from "./lib/dates";                                         
+        8 -import { EventDialog, type DialogState } from "./components/Ev
+          -entDialog";                                                   
+        3 +import dynamic from "next/dynamic";                           
+        4  
+       10 -const HOUR_PX = 48;                                           
+       11 -const PX_PER_MIN = HOUR_PX / 60;                              
+       12 -                                                              
+       13 -interface Menu {                                              
+       14 -  x: number;                                                  
+       15 -  y: number;                                                  
+       16 -  occ: Occurrence;                                            
+       17 -}                                                             
+        5 +// Client-only: the grid depends on the browser's time zone an
+          +d clock, which the                                            
+        6 +// server can't know, so server rendering it would always mism
+          +atch.                                                         
+        7 +const CalendarApp = dynamic(() => import("./components/Calenda
+          +rApp"), { ssr: false });                                      
+        8  
+        9  export default function Page() {
+       20 -  const [weekStart, setWeekStart] = useState(() => startOfWeek
+          -(new Date()));                                                
+       21 -  const [occs, setOccs] = useState<Occurrence[]>([]);         
+       22 -  const [error, setError] = useState<string | null>(null);    
+       23 -  const [dialog, setDialog] = useState<DialogState | null>(nul
+          -l);                                                           
+       24 -  const [menu, setMenu] = useState<Menu | null>(null);        
+       25 -  const [now, setNow] = useState(() => new Date());           
+       26 -  const [tz, setTz] = useState("");                           
+       27 -  const scroller = useRef<HTMLDivElement>(null);              
+       28 -                                                              
+       29 -  const days = useMemo(() => Array.from({ length: 7 }, (_, i) 
+          -=> addDays(weekStart, i)), [weekStart]);                      
+       30 -                                                              
+       31 -  const reload = useCallback(async () => {                    
+       32 -    try {                                                     
+       33 -      setOccs(await api.occurrences(weekStart, addDays(weekSta
+          -rt, 7)));                                                     
+       34 -      setError(null);                                         
+       35 -    } catch (e) {                                             
+       36 -      setError(`Could not load events: ${e instanceof Error ? 
+          -e.message : e}. Is the API running on :8000?`);               
+     … 153 more lines (ctrl+o to expand)
+
+⏺ reseeding and re-running the UI script:
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+
+⏺ Everything now renders correctly: short events are readable, overlaps sit side
+  by side, edited occurrences show dashed with a tag, DST doesn't shift times,
+  and the console is clean. I'm writing the README next.
+
+⏺ Write(README.md)
+  ⎿  Wrote 120 lines to README.md
+       1 # Calendar
+       2 
+       3 A small calendar with recurring events and exceptions: a Python 
+         core (stdlib `datetime` + `zoneinfo`, no scheduling libraries), 
+         a FastAPI JSON API, and a Next.js week-view UI.
+       4 
+       5 ```
+       6 backend/
+       7   calcore/models.py      Event, Rule, EventException, Occurrence
+       8   calcore/recurrence.py  rule expansion, exception application, 
+     … +113 lines (~7 KB) (ctrl+o to expand)
+
+⏺ Bash(sed -i '' 's/- A minimum duration of 1 minute. Titles are required./-
+      Durations must be positive (whole minutes over the API). Titles are
+      required./' README.md…)
+  ⎿  54 passed, 1 warning in 0.14s
+     tsc ok
+     ?? .gitignore
+     … +4 lines (ctrl+o to expand)
+  ⎿  Updated README.md (+1 -1)
+       94  ## Other assumptions
+       95  
+       96  - Overlapping events are allowed and laid out side by side. Fl
+           agging and explaining conflicts is planned as the first extens
+           ion.
+       97 -- A minimum duration of 1 minute. Titles are required.        
+       97 +- Durations must be positive (whole minutes over the API). Tit
+          +les are required.                                             
+       98  - Single-user, single-process. The API holds state in memory a
+           nd rewrites the JSON file atomically after every mutation. Not
+           hing coordinates multiple API processes.
+       99  - In "this" scope, time zone and recurrence can't be changed. 
+           Those are series properties, so the dialog disables them.
+      100  
+
+⏺ the calendar is built and running. the python backend's 54 pytest tests pass,
+  and i clicked through the UI in headless chromium (create, edit one
+  occurrence, right-click menu) with no console errors. it's at
+  http://localhost:3000, seeded with demo events around this week. nothing is
+  committed yet.
+
+  what's there
+  - data model: the Event / Rule / EventException you agreed to. start is a
+    local wall-clock time plus tz, and DST gaps and overlaps use zoneinfo's
+    fold=0 (written up in the README).
+  - recurrence:
+    - weekly via byweekday only, with an interval counted in weeks from the
+      start's week
+    - monthly skips months that don't have the day
+    - until is an inclusive date
+  - exceptions: one table keyed by (event_id, original_start). an occurrence
+    moved into the visible week from outside it still shows up, and exceptions
+    orphaned by a rule edit are ignored, then deleted on the next series edit.
+  - edit scopes: this / this and following (splits the series in two) / all. an
+    "all" edit that moves the time also moves the existing exceptions with it.
+    if an edit fails validation partway through, nothing changes.
+  - UI: a scrollable week grid with overlapping events side by side. click an
+    empty slot to create an event there, click an event to edit it, right-click
+    for delete this / following / all.
+  - demo data: seed.py covers a cancelled occurrence, a moved one, an
+    every-other-week 1:1, a monthly event that crosses DST, and an event that
+    crosses midnight.
+
+  worth knowing
+  - the API loads the JSON file at startup and then holds state in memory, so
+    restart it after running seed.py. that's fine for one user, and the README
+    says so.
+  - the UI is browser-only, with no server-side rendering. the grid depends on
+    the browser's timezone and clock, and rendering it on the server caused a
+    mismatch error.
+  - the one test warning is a deprecation notice from FastAPI's test client,
+    unrelated to this code.
+  - curl in your shell prints a schema summary instead of the response body,
+    which tripped me up during testing. i used python to fetch instead.
+
+  open item for you: "time spent" in the README is a TODO for you to fill in.
+
+  both dev servers are still running on :8000 and :3000. want me to commit, or
+  start on conflict detection next?
+
+✻ Churned for 9m 39s · done Thursday 5:45 PM
+
+❯ found a bug: moving a weekly series to another weekday with “all” doesn’t     
+  move it. take a weekly-on-monday series and edit an occurrence to tuesday     
+  with scope all. byweekday stays zero. then, start the conflict detection      
+  extension, and add a meeting recommendation interface (allow user to set      
+  working hours (9-5 weekdays default) then recommend a time based on meeting   
+  length). more stress testing of events too, if you can uncover more hbugs.    
+
+⏺ starting with the bug. i reproduced it: the series start moves to tuesday, but
+  byweekday stays (0,). so the series still generates mondays, just starting a
+  day later. and since the shifted exception keys land on tuesdays the rule
+  never generates, every exception on the series gets silently deleted as an
+  orphan. same root cause in "following" edits.
+
+  the fix shifts byweekday by the same number of days as the start. moving
+  monday to tuesday in a MWF series gives TThSa. i'm keeping the whole series
+  shifting by one delta, the same thing that already happens to exception keys,
+  which is what keeps them valid. if the caller explicitly sends a different
+  rule, it's respected as-is. the dialog will also shift the weekday toggles
+  when you change the date, so what you see is what gets saved.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ first, a regression test to confirm it fails before the fix:
+
+⏺ Bash(cd /Users/paulyoon/Projects/numenor-take-home/backend && cat >>
+      tests/test_service.py <<'EOF'…)
+  ⎿  FAILED tests/test_service.py::test_edit_all_moving_to_another_weekday_
+     shifts_byweekday
+     FAILED tests/test_service.py::test_edit_all_with_unchanged_rule_payloa
+     … +8 lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_service.py (+43 -0)
+      191      assert reloaded.events == cal.events
+      192      assert reloaded.exceptions == cal.exceptions
+      193      assert week_of(reloaded) == week_of(cal)
+      194 +                                                              
+      195 +                                                              
+      196 +def test_edit_all_moving_to_another_weekday_shifts_byweekday(c
+          +al, series):                                                  
+      197 +    # Regression: moving a Monday series to Tuesday with scope
+          +=all left                                                     
+      198 +    # byweekday=(0,), so it kept generating Mondays and orphan
+          +ed every exception.                                           
+      199 +    cal.cancel(series.id, datetime(2026, 11, 16, 9), Scope.THI
+          +S)                                                            
+      200 +    cal.edit(series.id, datetime(2026, 11, 9, 9), Scope.ALL, s
+          +tart=datetime(2026, 11, 10, 9))                               
+      201 +    assert cal.events[series.id].rule.byweekday == (1,)       
+      202 +    assert [o.local_start for o in week_of(cal)] == [         
+      203 +        datetime(2026, 11, 3, 9),                             
+      204 +        datetime(2026, 11, 10, 9),                            
+      205 +        datetime(2026, 11, 24, 9),  # 16th's cancellation move
+          +d to the 17th                                                 
+      206 +    ]                                                         
+      207 +                                                              
+      208 +                                                              
+      209 +def test_edit_all_with_unchanged_rule_payload_still_shifts(cal
+          +, series):                                                    
+      210 +    # The UI always sends the rule; an unchanged rule must not
+          + block the shift.                                             
+      211 +    cal.edit(series.id, series.start, Scope.ALL, start=datetim
+          +e(2026, 11, 4, 9), rule=series.rule)                          
+      212 +    assert cal.events[series.id].rule.byweekday == (2,)       
+      213 +                                                              
+      214 +                                                              
+      215 +def test_edit_all_explicit_new_rule_wins(cal, series):        
+      216 +    cal.edit(series.id, series.start, Scope.ALL, start=datetim
+          +e(2026, 11, 3, 9),                                            
+      217 +             rule=Rule(Freq.WEEKLY, byweekday=(1, 3)))        
+      218 +    assert cal.events[series.id].rule.byweekday == (1, 3)     
+      219 +                                                              
+      220 +                                                              
+      221 +def test_edit_all_multi_day_shift_wraps_week(cal):            
+      222 +    e = cal.add("MWF", datetime(2026, 11, 2, 9), HOUR, "Americ
+          +a/New_York",                                                  
+      223 +                Rule(Freq.WEEKLY, byweekday=(0, 2, 6)))       
+      224 +    cal.edit(e.id, datetime(2026, 11, 2, 9), Scope.ALL, start=
+          +datetime(2026, 11, 3, 9))                                     
+      225 +    assert cal.events[e.id].rule.byweekday == (0, 1, 3)  # Sun
+          + wraps to Mon                                                 
+      226 +                                                              
+      227 +                                                              
+      228 +def test_edit_all_time_past_midnight_shifts_weekday(cal, serie
+          +s):                                                           
+      229 +    cal.edit(series.id, series.start, Scope.ALL, start=datetim
+          +e(2026, 11, 2, 23, 30) + timedelta(hours=1))                  
+      230 +    assert cal.events[series.id].rule.byweekday == (1,)       
+     … 6 more lines (ctrl+o to expand)
+
+⏺ reproduced: 5 failures. the fix:
+
+⏺ Update(backend/calcore/service.py)
+  ⎿  Added 6 lines
+      142          delta = timedelta(0)
+      143          if new_start is not _UNSET:
+      144              delta = new_start - self._current_start(event, ori
+           ginal_start)
+      145 +        # A shift that lands on another day moves the weekly p
+          +attern with it,                                               
+      146 +        # unless the caller supplied a different rule of their
+          + own.                                                         
+      147 +        day_shift = ((event.start + delta).date() - event.star
+          +t.date()).days                                                
+      148 +        rule = changes.get("rule", event.rule)                
+      149 +        if day_shift and rule == event.rule and rule and rule.
+          +freq is Freq.WEEKLY:                                          
+      150 +            changes["rule"] = replace(rule, byweekday=tuple((d
+          + + day_shift) % 7 for d in rule.byweekday))                   
+      151          updated = replace(event, start=event.start + delta, **
+           changes)
+      152          self.events[event.id] = updated
+      153          # Keep exceptions attached to the same (shifted) occur
+           rences; drop any
+
+⏺ Bash(sed -i '' 's/from .models import Event, EventException, Occurrence, Rule,
+      Scope/from .models import Event, EventException, Freq, Occurrence, Rule,
+      Scope/' calco…)
+  ⎿  60 passed, 1 warning in 0.14s
+  ⎿  Updated backend/calcore/service.py (+1 -1)
+       7  from datetime import datetime, timedelta
+       8  from typing import Any
+       9  
+      10 -from .models import Event, EventException, Occurrence, Rule, Sc
+         -ope                                                            
+      10 +from .models import Event, EventException, Freq, Occurrence, Ru
+         +le, Scope                                                      
+      11  from .recurrence import expand, is_occurrence
+      12  from .store import JsonStore
+      13  
+
+⏺ All 60 tests pass now. Before building features, I'm stress-testing the core
+  with Hypothesis: a brute-force daily oracle for the recurrence math, a check
+  that splitting a query window leaves results unchanged, and random
+  add/edit/cancel sequences across all scopes with invariants checked at each
+  step.
+
+⏺ Bash(uv add --dev hypothesis 2>&1 | tail -1)
+  ⎿   + sortedcontainers==2.4.0
+  ⎿  Updated backend/pyproject.toml (+1 -0)
+      11  dev = [
+      12      "pytest>=8",
+      13      "httpx>=0.27",
+      14 +    "hypothesis>=6.170.13",                                    
+      15  ]
+      16  
+      17  [tool.pytest.ini_options]
+  ⎿  Updated backend/uv.lock (+92 -0)
+      45  [package.dev-dependencies]
+      46  dev = [
+      47      { name = "httpx" },
+      48 +    { name = "hypothesis" },                                   
+      49      { name = "pytest" },
+      50  ]
+      51  
+     ...
+      58  [package.metadata.requires-dev]
+      59  dev = [
+      60      { name = "httpx", specifier = ">=0.27" },
+      61 +    { name = "hypothesis", specifier = ">=6.170.13" },         
+      62      { name = "pytest", specifier = ">=8" },
+      63  ]
+      64  
+     ...
+      143      { url = "https://files.pythonhosted.org/packages/2a/39/e50
+           c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/http
+           x-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf
+           814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, 
+           upload-time = "2024-12-06T15:37:21.509Z" },
+      144  ]
+      145  
+      146 +[[package]]                                                   
+      147 +name = "hypothesis"                                           
+      148 +version = "6.170.13"                                          
+      149 +source = { registry = "https://pypi.org/simple" }             
+      150 +dependencies = [                                              
+      151 +    { name = "sortedcontainers" },                            
+      152 +]                                                             
+      153 +sdist = { url = "https://files.pythonhosted.org/packages/7f/61
+          +/6e42f6b39ed979146fe4338ab944212e0d173ef736903560bddf3a63119d/
+          +hypothesis-6.170.13.tar.gz", hash = "sha256:1c8a34368f7298796e
+          +5a6502d33ffda9c4944158cf484dd575dd0cabc1eccd8c", size = 521517
+          +, upload-time = "2026-10-28T14:03:39.906Z" }                  
+      154 +wheels = [                                                    
+      155 +    { url = "https://files.pythonhosted.org/packages/59/29/861
+          +d01882d6a53f0729184686fa02b6e5980bb0e882e247c85afe9571d77/hypo
+          +thesis-6.170.13-cp311-abi3-macosx_10_12_x86_64.whl", hash = "s
+          +ha256:103dc787a002d62875fc4d0dad3b39551faf543aa8530598d0470301
+          +eb4b1753", size = 800107, upload-time = "2026-10-28T14:01:47.8
+          +65Z" },                                                       
+      156 +    { url = "https://files.pythonhosted.org/packages/b2/5a/0ca
+          +a76466ba1cfd631ce288c4d269865f0e6d350a136001304668f5bb9b5/hypo
+          +thesis-6.170.13-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha
+          +256:24242fd166172973bb3f3dbcb240f024c8cf0d02e5995773bd26e37a34
+          +0c7d7f", size = 795246, upload-time = "2026-10-28T14:02:12.927
+          +Z" },                                                         
+      157 +    { url = "https://files.pythonhosted.org/packages/d7/8d/b80
+          +091f2366ff5422662219b3a6fc1e217ede56f64179964192a466900bb/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_17_aarch64.manylinux201
+          +4_aarch64.whl", hash = "sha256:68ce73493c9150ef4c93c64dbc05080
+          +0fed76989ac2111b0c4e71035c6bb33fa", size = 1124164, upload-tim
+          +e = "2026-10-28T14:03:12.714Z" },                             
+      158 +    { url = "https://files.pythonhosted.org/packages/09/d5/3a6
+          +e48bd7c5a231cfa07373c1d0d64cf41abc8bd80eea59ec0d83e079d8c/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_17_armv7l.manylinux2014
+          +_armv7l.whl", hash = "sha256:94ed083bb8da3b5d9252fd5f330d780d8
+          +df5895ad1c27b86539df3705020e40a", size = 1154675, upload-time 
+          += "2026-10-28T14:02:47.964Z" },                               
+      159 +    { url = "https://files.pythonhosted.org/packages/96/b4/4fb
+          +8b498f1fa0d2a7838c5599afd5aa7c78e07a18744a2da664d06faace3/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_17_ppc64le.manylinux201
+          +4_ppc64le.whl", hash = "sha256:a7f554ed849d8626ee351b88ead63c3
+          +7797b098e2cb6a8e8537739698a25b35b", size = 1148571, upload-tim
+          +e = "2026-10-28T14:01:57.904Z" },                             
+      160 +    { url = "https://files.pythonhosted.org/packages/d4/8e/bd1
+          +7a2abf52c3fb47457d3cc82d98deb94d56d748e81899ff716a11d2940/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_17_s390x.manylinux2014_
+          +s390x.whl", hash = "sha256:d32d02e0a5473621db88b8abd3720bb0ac2
+          +1f02d4b09b88f568517f286bc694f", size = 1201322, upload-time = 
+          +"2026-10-28T14:02:45.298Z" },                                 
+      161 +    { url = "https://files.pythonhosted.org/packages/a6/b5/328
+          +c4081e8cd0b1389d40112779f11f130f044092784990cf18bee5bf202/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_17_x86_64.manylinux2014
+          +_x86_64.whl", hash = "sha256:6332741657d5c4c5de9a58422b56be08b
+          +d66d0af7fa62ee15251490f1beb377e", size = 1167576, upload-time 
+          += "2026-10-28T14:03:01.817Z" },                               
+      162 +    { url = "https://files.pythonhosted.org/packages/d2/b5/c74
+          +9cb20ab335f3c1aeb6e36d4e62d809b0274fea307b8e25700312468db/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_31_riscv64.whl", hash =
+          + "sha256:26b1e3981bba2a448e607fbfb5b64dc6125e908932d5bb6a2dc93
+          +fb05d081e54", size = 1123725, upload-time = "2026-10-28T14:02:
+          +54.531Z" },                                                   
+      163 +    { url = "https://files.pythonhosted.org/packages/5f/ca/5ba
+          +5ef46aed3fae8f63a7ac27af49ecfa6c9a67ede5f064a6a08c7cc3d9c/hypo
+          +thesis-6.170.13-cp311-abi3-manylinux_2_5_i686.manylinux1_i686.
+          +whl", hash = "sha256:b624ec19a0a8b2d175538dcfc8db17f321718ec85
+          +a3111c1c8b6993ece852b9c", size = 1162017, upload-time = "2026-
+          +10-28T14:02:02.397Z" },                                       
+      164 +    { url = "https://files.pythonhosted.org/packages/85/1a/627
+          +832a2d007a5a5c5dc86616023611b14d4241e402269c3146811370134/hypo
+          +thesis-6.170.13-cp311-abi3-musllinux_1_2_aarch64.whl", hash = 
+          +"sha256:652a75be32f5f151c8ed23dad5eaf7c6e48f8fca889ec7f0417dab
+          +22c0c7a55d", size = 1299101, upload-time = "2026-10-28T14:01:4
+          +6.32Z" },                                                     
+      165 +    { url = "https://files.pythonhosted.org/packages/41/66/ee1
+          +1fbab13e5ee110fa565fe5d413294e2e7c79b92ba93dde306221482c2/hypo
+          +thesis-6.170.13-cp311-abi3-musllinux_1_2_armv7l.whl", hash = "
+          +sha256:be7eb13c1b68bececf0dcfe885407850e31da88397f74564b15fd7d
+          +09ff7cf47", size = 1427798, upload-time = "2026-10-28T14:03:20
+          +.175Z" },                                                     
+      166 +    { url = "https://files.pythonhosted.org/packages/77/46/5d3
+          +cc80c3050c6c04d69939acc0a47b3a36eda4380e8049e4d7612a541b1/hypo
+          +thesis-6.170.13-cp311-abi3-musllinux_1_2_i686.whl", hash = "sh
+          +a256:722b10735932e07582aef7c7aa61b3e970c4d5abbbf480fd0c74b1a49
+          +b294416", size = 1381831, upload-time = "2026-10-28T14:03:30.3
+          +39Z" },                                                       
+      167 +    { url = "https://files.pythonhosted.org/packages/be/5b/5d0
+          +c99157da7b659e4a36fba144bf5de9b9f14c2e97f4ab8c51c880ac8d3/hypo
+          +thesis-6.170.13-cp311-abi3-musllinux_1_2_ppc64le.whl", hash = 
+          +"sha256:0699a004a6bb9a49adfaca6977475ffeaf3b78395292101ad288e7
+          +49562f5d9c", size = 1277829, upload-time = "2026-10-28T14:03:1
+          +7.425Z" },                                                    
+      168 +    { url = "https://files.pythonhosted.org/packages/31/31/ade
+          +bd3a5c7c5cf3b58e3e03c9f343d7e7bf7a8cc01078b191bdb7227b9f8/hypo
+          +thesis-6.170.13-cp311-abi3-musllinux_1_2_riscv64.whl", hash = 
+          +"sha256:4a20c152d748b6b02ba7c66e5b8d4767e42ce1110aaee8f1b6af17
+          +6b7c8cc8de", size = 1293562, upload-time = "2026-10-28T14:01:5
+          +6.543Z" },                                                    
+     … 76 more lines (ctrl+o to expand)
+
+⏺ Write(backend/tests/test_properties.py)
+  ⎿  Wrote 191 lines to backend/tests/test_properties.py
+       1 """Property-based stress tests: brute-force oracles and invarian
+         ts under random edits."""
+       2 
+       3 from collections import Counter
+       4 from datetime import UTC, date, datetime, time, timedelta
+       5 
+       6 from hypothesis import HealthCheck, assume, given, settings
+       7 from hypothesis import strategies as st
+       8 
+       9 from calcore.models import Event, Freq, Rule, Scope
+     … +182 lines (ctrl+o to expand)
+
+⏺ i left a junk assertion in the edit(this) branch. removing it before running:
+
+⏺ Bash(python3 - <<'EOF'
+      p='tests/test_properties.py'; s=open(p).read()…)
+  ⎿  >           assert next(candidate_dates(event, date.min, date.max), No
+     ne) is not None, event
+     E           AssertionError: Event(id='23708021', title='T', start=date
+     … +10 lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_properties.py (+3 -4)
+       3  from collections import Counter
+       4  from datetime import UTC, date, datetime, time, timedelta
+       5  
+       6 -from hypothesis import HealthCheck, assume, given, settings    
+       6 +from hypothesis import HealthCheck, given, settings            
+       7  from hypothesis import strategies as st
+       8  
+       9  from calcore.models import Event, Freq, Rule, Scope
+      10  from calcore.recurrence import candidate_dates, expand, is_occu
+          rrence
+      11 -from calcore.service import Calendar, NotFound                 
+      11 +from calcore.service import Calendar                           
+      12  from calcore.store import JsonStore
+      13  
+      14  ZONES = ["UTC", "America/New_York", "Europe/London", "Australia
+          /Lord_Howe", "Asia/Kolkata", "America/Santiago"]
+     ...
+      157                      if scope is Scope.THIS and target.recurrin
+           g:
+      158                          after = snapshot(cal)
+      159                          before[target_key] -= 1
+      160 -                        assert +(after - before) == after - +b
+          -efore or True                                                 
+      161 -                        # everything else is untouched        
+      160 +                        # everything except the edited occurre
+          +nce is untouched                                              
+      161                          assert +(before - after) == Counter(),
+            "edit(this) changed other occurrences"
+      162          except ValueError:
+      163              pass  # rejected input is fine; state must still b
+           e valid
+
+⏺ I found a real bug: a recurrence rule that generates no occurrences (weekly on
+  Monday, starting Thursday) leaves an invisible event in storage, reachable
+  through direct creation, "all" edits, and "following" splits. I'll reject such
+  rules, remove series that end up empty, and check the first generated date
+  instead of the start date.
+
+⏺ Bash(python3 - <<'EOF'
+      p='calcore/recurrence.py'; s=open(p).read()…)
+  ⎿  65 passed, 1 warning in 0.93s
+  ⎿  Updated backend/calcore/recurrence.py (+6 -0)
+      59              k += rule.interval
+      60  
+      61  
+      62 +def first_occurrence(event: Event) -> datetime | None:         
+      63 +    """Local start of the earliest generated occurrence, or Non
+         +e if there are none."""                                        
+      64 +    d = next(candidate_dates(event, event.start.date(), date.ma
+         +x), None)                                                      
+      65 +    return datetime.combine(d, event.start.time()) if d else No
+         +ne                                                             
+      66 +                                                               
+      67 +                                                               
+      68  def is_occurrence(event: Event, local: datetime) -> bool:
+      69      """Whether the rule generates an occurrence starting at thi
+          s local time."""
+      70      if local.time() != event.start.time():
+  ⎿  Updated backend/calcore/service.py (+18 -8)
+       8  from typing import Any
+       9  
+      10  from .models import Event, EventException, Freq, Occurrence, Ru
+          le, Scope
+      11 -from .recurrence import expand, is_occurrence                  
+      11 +from .recurrence import expand, first_occurrence, is_occurrence
+      12  from .store import JsonStore
+      13  
+      14  _UNSET: Any = object()
+     ...
+      24      return uuid.uuid4().hex[:8]
+      25  
+      26  
+      27 +def _require_generates(event: Event) -> Event:                 
+      28 +    if first_occurrence(event) is None:                        
+      29 +        raise ValueError("this recurrence produces no occurrenc
+         +es (check the weekdays and until date)")                       
+      30 +    return event                                               
+      31 +                                                               
+      32 +                                                               
+      33  class Calendar:
+      34      """Events, their exceptions, and the edit/cancel operations
+           on them.
+      35  
+     ...
+      74      def add(
+      75          self, title: str, start: datetime, duration: timedelta,
+           tz: str, rule: Rule | None = None
+      76      ) -> Event:
+      71 -        event = Event(_new_id(), title, start, duration, tz, ru
+         -le)                                                            
+      77 +        event = _require_generates(Event(_new_id(), title, star
+         +t, duration, tz, rule))                                        
+      78          with self._transaction():
+      79              self.events[event.id] = event
+      80              self.exceptions[event.id] = {}
+     ...
+      101                  return self._edit_series(event, original_start
+           , changes)
+      102              if scope is Scope.THIS:
+      103                  return self._edit_one(event, original_start, c
+           hanges)
+       98 -            if original_start.date() <= event.start.date():  #
+          - first occurrence: whole series                               
+      104 +            if original_start == first_occurrence(event):  # f
+          +rom the first: whole series                                   
+      105                  return self._edit_series(event, original_start
+           , changes)
+      106              tail = self._split(event, original_start)
+      107              return self._edit_series(tail, original_start, cha
+           nges)
+     ...
+      113          self._require_occurrence(event, original_start)
+      114          with self._transaction():
+      115              if event.rule is None or scope is Scope.ALL or (
+      110 -                scope is Scope.FOLLOWING and original_start.da
+          -te() <= event.start.date()                                    
+     … 28 more lines (ctrl+o to expand)
+
+⏺ all 65 pass. turning the example count way up for a deeper one-off run:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ the explicit @settings on the two stateful tests overrides the profile. i'll
+  move example counts into a conftest profile so a heavy run is one env var:
+
+⏺ Bash(rm -f /private/tmp/claude-501/-Users-paulyoon-Projects-numenor-take-home/
+      d92176a8-8158-4aa1-8b01-d438b7e15024/scratchpad/conftest_heavy.py && cat >
+      tests/confte…)
+  ⎿  PreToolUse:Bash says: rm intercepted -> redirected to trash
+  ⎿  131:@settings(suppress_health_check=[HealthCheck.too_slow])
+     167:@settings(suppress_health_check=[HealthCheck.function_scoped_fixtu
+     re])
+     … +30 lines (ctrl+o to expand)
+  ⎿  Created backend/tests/conftest.py (+10 -0)
+       1 +import os                                                      
+       2 +                                                               
+       3 +from hypothesis import HealthCheck, settings                   
+       4 +                                                               
+       5 +# HYPOTHESIS_PROFILE=heavy uv run pytest  for a long stress run
+         +.                                                              
+       6 +settings.register_profile("default", max_examples=200, deadline
+         +=None)                                                         
+       7 +settings.register_profile(                                     
+       8 +    "heavy", max_examples=5000, deadline=None, suppress_health_
+         +check=[HealthCheck.too_slow]                                   
+       9 +)                                                              
+      10 +settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "def
+         +ault"))                                                        
+  ⎿  Updated backend/tests/test_properties.py (+2 -2)
+      128      return Counter((o.title, o.start, o.end) for o in cal.occu
+           rrences(*WINDOW))
+      129  
+      130  
+      131 -@settings(max_examples=300, deadline=None, suppress_health_che
+          -ck=[HealthCheck.too_slow])                                    
+      131 +@settings(suppress_health_check=[HealthCheck.too_slow])       
+      132  @given(ops)
+      133  def test_random_operations_keep_invariants(sequence):
+      134      cal = Calendar()
+     ...
+      164          check_invariants(cal)
+      165  
+      166  
+      167 -@settings(max_examples=100, deadline=None, suppress_health_che
+          -ck=[HealthCheck.function_scoped_fixture])                     
+      167 +@settings(suppress_health_check=[HealthCheck.function_scoped_f
+          +ixture])                                                      
+      168  @given(ops)
+      169  def test_random_operations_roundtrip_through_store(tmp_path_fa
+           ctory, sequence):
+      170      path = tmp_path_factory.mktemp("cal") / "cal.json"
+  ⎿  (timeout 10m)
+
+⏺ Python subtracts and compares same-zone aware datetimes by wall-clock time, so
+  Santiago's fall-back night makes a 6-hour event read as 5 hours. That shrinks
+  events on save and would break sorting and the coming conflict check, so I'll
+  make Occurrence store UTC internally and convert to local only for display.
+
+⏺ Bash(python3 - <<'EOF'
+      p='calcore/models.py'; s=open(p).read()…)
+  ⎿  105:    zone = event.zone
+     65 passed, 1 warning in 1.02s
+  ⎿  Updated backend/api.py (+3 -3)
+      73          return {
+      74              "event_id": o.event_id,
+      75              "title": o.title,
+      76 -            "start": o.start.isoformat(),                      
+      77 -            "end": o.end.isoformat(),                          
+      76 +            "start": o.zoned_start.isoformat(),                
+      77 +            "end": o.zoned_end.isoformat(),                    
+      78              "local_start": o.local_start.isoformat(),
+      79 -            "duration": int((o.end - o.start).total_seconds() /
+         -/ 60),                                                         
+      79 +            "duration": int(o.duration.total_seconds() // 60), 
+      80              "original_start": o.original_start.isoformat(),
+      81              "tz": o.tz,
+      82              "recurring": o.recurring,
+  ⎿  Updated backend/calcore/models.py (+19 -2)
+      100  
+      101  @dataclass(frozen=True)
+      102  class Occurrence:
+      103 -    """A concrete, timezone-aware instance shown on the calend
+          -ar."""                                                        
+      103 +    """A concrete instance shown on the calendar.             
+      104 +                                                              
+      105 +    `start` and `end` are UTC. Python compares and subtracts a
+          +ware datetimes that                                           
+      106 +    share a tzinfo by wall-clock time, which is wrong across D
+          +ST, so local                                                  
+      107 +    times are only produced for display.                      
+      108 +    """                                                       
+      109  
+      110      event_id: str
+      111      title: str
+     ...
+      116      recurring: bool
+      117      modified: bool
+      118  
+      119 +    @property                                                 
+      120 +    def zoned_start(self) -> datetime:                        
+      121 +        return self.start.astimezone(ZoneInfo(self.tz))       
+      122 +                                                              
+      123 +    @property                                                 
+      124 +    def zoned_end(self) -> datetime:                          
+      125 +        return self.end.astimezone(ZoneInfo(self.tz))         
+      126 +                                                              
+      127      @property
+      128      def local_start(self) -> datetime:
+      116 -        return self.start.replace(tzinfo=None)                
+      129 +        return self.zoned_start.replace(tzinfo=None)          
+      130 +                                                              
+      131 +    @property                                                 
+      132 +    def duration(self) -> timedelta:                          
+      133 +        return self.end - self.start                          
+  ⎿  Updated backend/calcore/recurrence.py (+2 -3)
+      75  def _occurrence(
+      76      event: Event, original: datetime, start: datetime, duration
+          : timedelta, title: str, modified: bool
+      77  ) -> Occurrence:
+      78 -    zone = event.zone                                          
+      79 -    start_at = localize(start, zone)                           
+      80 -    end_at = (start_at.astimezone(UTC) + duration).astimezone(z
+         -one)                                                           
+      78 +    start_at = localize(start, event.zone).astimezone(UTC)     
+      79 +    end_at = start_at + duration                               
+      80      return Occurrence(
+      81          event_id=event.id,
+      82          title=title,
+  ⎿  Updated backend/tests/test_recurrence.py (+4 -3)
+      78      # 2026-03-08 02:30 doesn't exist in New York; fold=0 maps i
+          t to 03:30 EDT.
+      79      e = ev(datetime(2026, 3, 7, 2, 30), Rule(Freq.WEEKLY, bywee
+          kday=(5, 6)))
+      80      occs = expand(e, {}, *window(date(2026, 3, 7), date(2026, 3
+          , 9)))
+      81 -    assert [(o.start.day, o.start.hour, o.start.minute) for o i
+         -n occs] == [(7, 2, 30), (8, 3, 30)]                            
+      81 +    assert [(o.local_start.day, o.local_start.hour, o.local_sta
+         +rt.minute) for o in occs] == [(7, 2, 30), (8, 3, 30)]          
+      82      assert occs[1].original_start == datetime(2026, 3, 8, 2, 30
+          )
+      83  
+      84  
+      85  def test_fall_back_ambiguous_time_takes_first_instant():
+      86      e = ev(datetime(2026, 11, 1, 1, 30))
+      87      (occ,) = expand(e, {}, *window(date(2026, 11, 1), date(2026
+          , 11, 2)))
+      88 -    assert occ.start.utcoffset() == timedelta(hours=-4)  # EDT,
+         - the earlier 01:30                                             
+      88 +    assert occ.zoned_start.utcoffset() == timedelta(hours=-4)  
+         +# EDT, the earlier 01:30                                       
+      89  
+      90  
+      91  def test_duration_is_elapsed_time_across_dst():
+      92      # 00:00 + 4h on fall-back night is 03:00 local (one extra h
+          our on the clock).
+      93      e = ev(datetime(2026, 11, 1, 0), duration=timedelta(hours=4
+          ))
+      94      (occ,) = expand(e, {}, *window(date(2026, 11, 1), date(2026
+          , 11, 2)))
+      95 -    assert occ.end.replace(tzinfo=None) == datetime(2026, 11, 1
+         -, 3)                                                           
+      95 +    assert occ.zoned_end.replace(tzinfo=None) == datetime(2026,
+         + 11, 1, 3)                                                     
+      96 +    assert occ.duration == timedelta(hours=4)                  
+      97  
+      98  
+      99  def test_event_spanning_window_start_is_included():
+
+⏺ adding an API-level regression test for that, then a heavy run:
+⏺ Bash(cat >> tests/test_api.py <<'EOF'…)
+  ⎿  66 passed, 1 warning in 21.36s
+  ⎿  Updated backend/tests/test_api.py (+13 -0)
+      62                                              "tz": "Nope/Zone"})
+          .status_code == 400
+      63      assert client.delete(f"/api/events/{eid}/occurrences/2026-1
+          1-03T09:00:00").status_code == 404
+      64      assert client.get("/api/occurrences", params={"start": "202
+          6-11-02T00:00", "end": "2026-11-03T00:00"}).status_code == 400
+      65 +                                                               
+      66 +                                                               
+      67 +def test_duration_reported_correctly_across_dst(client):       
+      68 +    # Regression: duration was computed as end - start on same-
+         +zone aware                                                     
+      69 +    # datetimes (wall-clock subtraction), reporting 5h for a 6h
+         + event on                                                      
+      70 +    # fall-back night; saving the edit dialog then shrank the e
+         +vent.                                                          
+      71 +    client.post("/api/events", json={"title": "Overnight", "sta
+         +rt": "2026-10-31T23:00", "duration": 360,                      
+      72 +                                     "tz": "America/New_York"})
+      73 +    (occ,) = client.get("/api/occurrences", params={"start": "2
+         +026-10-31T00:00:00Z",                                          
+      74 +                                                     "end": "20
+         +26-11-02T00:00:00Z"}).json()                                   
+      75 +    assert occ["duration"] == 360                              
+      76 +    assert occ["start"] == "2026-10-31T23:00:00-04:00"         
+      77 +    assert occ["end"] == "2026-11-01T04:00:00-05:00"           
+  ⎿  (timeout 10m)
+
+⏺ the heavy run is clean (5000 examples per property). now probing the
+  input-validation holes i suspected, by hand:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Four bugs turned up in the probes: an aware datetime in the URL slipped
+  through and produced a duplicate occurrence, an aware override start lost its
+  offset, a blank override title was accepted silently, and windows near the max
+  date crashed with a 500. I'm fixing all four at the service boundary.
+
+⏺ Bash(python3 - <<'EOF'
+      p='calcore/service.py'; s=open(p).read()…)
+  ⎿  72 passed, 1 warning in 1.51s
+  ⎿  Updated backend/calcore/service.py (+15 -0)
+      12  from .store import JsonStore
+      13  
+      14  _UNSET: Any = object()
+      15 +MAX_WINDOW = timedelta(days=3660)                              
+      16  _SERIES_FIELDS = {"title", "start", "duration", "tz", "rule"}
+      17  _OCCURRENCE_FIELDS = {"title", "start", "duration"}
+      18  
+     ...
+      25      return uuid.uuid4().hex[:8]
+      26  
+      27  
+      28 +def _require_naive(dt: datetime, name: str) -> None:           
+      29 +    if dt.tzinfo is not None:                                  
+      30 +        raise ValueError(f"{name} must be a naive wall-clock ti
+         +me in the event's time zone")                                  
+      31 +                                                               
+      32 +                                                               
+      33  def _require_generates(event: Event) -> Event:
+      34      if first_occurrence(event) is None:
+      35          raise ValueError("this recurrence produces no occurrenc
+          es (check the weekdays and until date)")
+     ...
+      69              raise ValueError("window bounds must be timezone-aw
+          are")
+      70          if window_end <= window_start:
+      71              raise ValueError("window end must be after start")
+      72 +        if window_end - window_start > MAX_WINDOW:             
+      73 +            raise ValueError("window is limited to 10 years")  
+      74 +        if window_start.year < 2 or window_end.year > 9998:    
+      75 +            raise ValueError("window is out of range")         
+      76          out = []
+      77          for e in self.events.values():
+      78              out.extend(expand(e, self.exceptions.get(e.id, {}),
+           window_start, window_end))
+     ...
+      101          scope = Scope(scope)
+      102          event = self.get(event_id)
+      103          self._require_occurrence(event, original_start)
+      104 +        if "start" in changes:                                
+      105 +            _require_naive(changes["start"], "start")         
+      106          allowed = _OCCURRENCE_FIELDS if scope is Scope.THIS an
+           d event.rule else _SERIES_FIELDS
+      107          unknown = set(changes) - allowed
+      108          if unknown:
+     ...
+      139      # -- internals -------------------------------------------
+           --------------
+      140  
+      141      def _require_occurrence(self, event: Event, original_start
+           : datetime) -> None:
+      142 +        _require_naive(original_start, "original_start")      
+     … 11 more lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_api.py (+27 -0)
+       75      assert occ["duration"] == 360
+       76      assert occ["start"] == "2026-10-31T23:00:00-04:00"
+       77      assert occ["end"] == "2026-11-01T04:00:00-05:00"
+       78 +                                                              
+       79 +                                                              
+       80 +@pytest.mark.parametrize("path_key, body", [                  
+       81 +    # Regression: an aware key passed is_occurrence, was store
+          +d under a key that                                            
+       82 +    # never matched, and produced a duplicate occurrence.     
+       83 +    ("2026-11-04T09:00:00-05:00", {"scope": "this", "title": "
+          +x"}),                                                         
+       84 +    # Regression: an aware override start had its offset silen
+          +tly dropped.                                                  
+       85 +    ("2026-11-04T09:00:00", {"scope": "this", "start": "2026-1
+          +1-04T10:00:00Z"}),                                            
+       86 +    ("2026-11-04T09:00:00", {"scope": "this", "title": "   "})
+          +,                                                             
+       87 +])                                                            
+       88 +def test_rejects_bad_occurrence_edits(client, path_key, body):
+       89 +    eid = create_series(client)                               
+       90 +    assert client.put(f"/api/events/{eid}/occurrences/{path_ke
+          +y}", json=body).status_code == 400                            
+       91 +    occs = client.get("/api/occurrences", params=WEEK).json() 
+       92 +    assert [o["local_start"] for o in occs] == [              
+       93 +        "2026-11-02T09:00:00", "2026-11-04T09:00:00", "2026-11
+          +-06T09:00:00",                                                
+       94 +    ]                                                         
+       95 +                                                              
+       96 +                                                              
+       97 +@pytest.mark.parametrize("window", [                          
+       98 +    {"start": "9999-12-30T00:00:00Z", "end": "9999-12-31T00:00
+          +:00Z"},  # regression: 500 OverflowError                      
+       99 +    {"start": "2000-01-01T00:00:00Z", "end": "2100-01-01T00:00
+          +:00Z"},                                                       
+      100 +    {"start": "2026-11-02T00:00:00Z", "end": "2026-11-01T00:00
+          +:00Z"},                                                       
+      101 +])                                                            
+      102 +def test_rejects_bad_windows(client, window):                 
+      103 +    create_series(client)                                     
+      104 +    assert client.get("/api/occurrences", params=window).statu
+          +s_code == 400                                                 
+
+⏺ remaining probes: seconds precision through the store, and the interval>1
+  week-boundary shift i suspected:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Two more bugs: a 90-second duration silently drops to 60 after a save, since
+  whole minutes are stored, and shifting a biweekly series across a week
+  boundary breaks its cadence. I'm fixing the second by storing a cycle anchor
+  in the rule, with two new property tests to guard both.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Bash(python3 - <<'EOF'
+      p='calcore/models.py'; s=open(p).read()…)
+  ⎿  10:from .models import Event, EventException, Freq, Occurrence, Rule,
+     Scope
+     166:            and rule.freq is old_rule.freq is Freq.WEEKLY and rule
+     … +3 lines (ctrl+o to expand)
+  ⎿  Updated backend/api.py (+2 -1)
+      18      interval: int = 1
+      19      byweekday: list[int] = []
+      20      until: date | None = None
+      21 +    anchor: date | None = None                                 
+      22  
+      23      def to_rule(self) -> Rule:
+      23 -        return Rule(self.freq, self.interval, tuple(self.byweek
+         -day), self.until)                                              
+      24 +        return Rule(self.freq, self.interval, tuple(self.byweek
+         +day), self.until, self.anchor)                                 
+      25  
+      26  
+      27  class EventIn(BaseModel):
+  ⎿  Updated backend/calcore/models.py (+29 -4)
+      1  from __future__ import annotations
+      2  
+      3 -from dataclasses import dataclass                               
+      3 +from dataclasses import dataclass, replace                      
+      4  from datetime import date, datetime, timedelta
+      5  from enum import StrEnum
+      6  from zoneinfo import ZoneInfo
+     ...
+      17      ALL = "all"
+      18  
+      19  
+      20 +def _check_duration(d: timedelta) -> None:                     
+      21 +    if d <= timedelta(0):                                      
+      22 +        raise ValueError("duration must be positive")          
+      23 +    if d % timedelta(minutes=1):                               
+      24 +        raise ValueError("duration must be a whole number of mi
+         +nutes")                                                        
+      25 +                                                               
+      26 +                                                               
+      27  @dataclass(frozen=True)
+      28  class Rule:
+      29      """Recurrence rule.
+      30  
+      31      WEEKLY: repeats on each day in `byweekday` (0=Mon..6=Sun), 
+          every `interval`
+      25 -    weeks counted from the week (Mon-Sun) containing the event'
+         -s start.                                                       
+      32 +    weeks. Weeks are 7-day cycles beginning at `anchor`, which 
+         +defaults to the                                                
+      33 +    Monday of the start's week; it only matters when interval >
+         + 1 and is kept                                                 
+      34 +    explicit so shifting or splitting a series preserves its ca
+         +dence exactly.                                                 
+      35      MONTHLY: repeats on the start's day-of-month every `interva
+          l` months;
+      36      months without that day (e.g. the 31st in April) are skippe
+          d.
+      37      `until` is an inclusive date in the event's time zone.
+     ...
+      41      interval: int = 1
+      42      byweekday: tuple[int, ...] = ()
+      43      until: date | None = None
+      44 +    anchor: date | None = None                                 
+      45  
+      46      def __post_init__(self) -> None:
+      47          object.__setattr__(self, "freq", Freq(self.freq))
+     ...
+      55          if self.freq is Freq.MONTHLY and days:
+      56              raise ValueError("monthly rules do not take byweekd
+          ay")
+      57          object.__setattr__(self, "byweekday", days)
+      58 +        if self.freq is not Freq.WEEKLY or self.interval == 1: 
+     … 33 more lines (ctrl+o to expand)
+  ⎿  Updated backend/calcore/recurrence.py (+4 -3)
+      33          return
+      34  
+      35      if rule.freq is Freq.WEEKLY:
+      36 -        anchor = first - timedelta(days=first.weekday())       
+      36 +        anchor = rule.anchor or first - timedelta(days=first.we
+         +ekday())                                                       
+      37 +        offsets = sorted((wd - anchor.weekday()) % 7 for wd in 
+         +rule.byweekday)                                                
+      38          step = 7 * rule.interval
+      39          week = anchor + timedelta(days=(lo - anchor).days // st
+          ep * step)
+      40          while week <= hi:
+      40 -            for wd in rule.byweekday:                          
+      41 -                d = week + timedelta(days=wd)                  
+      41 +            for off in offsets:                                
+      42 +                d = week + timedelta(days=off)                 
+      43                  if lo <= d <= hi:
+      44                      yield d
+      45              week += timedelta(days=step)
+  ⎿  Updated backend/calcore/service.py (+16 -9)
+      151          excs = self.exceptions[event.id]
+      152          exc = excs.get(original_start) or EventException(event
+           .id, original_start)
+      153          exc = replace(exc, cancelled=False, **changes)
+      154 -        if exc.duration is not None and exc.duration <= timede
+          -lta(0):                                                       
+      155 -            raise ValueError("duration must be positive")     
+      156 -        if exc.title is not None and not exc.title.strip():   
+      157 -            raise ValueError("title is required")             
+      154          excs[original_start] = exc
+      155          return event
+      156  
+     ...
+      159          delta = timedelta(0)
+      160          if new_start is not _UNSET:
+      161              delta = new_start - self._current_start(event, ori
+           ginal_start)
+      166 -        # A shift that lands on another day moves the weekly p
+          -attern with it,                                               
+      167 -        # unless the caller supplied a different rule of their
+          - own.                                                         
+      162 +        old_rule = event.rule                                 
+      163 +        rule = changes.get("rule", old_rule)                  
+      164 +        if (                                                  
+      165 +            rule and old_rule and rule.anchor is None         
+      166 +            and rule.freq is old_rule.freq is Freq.WEEKLY and 
+          +rule.interval == old_rule.interval                            
+      167 +        ):                                                    
+      168 +            rule = replace(rule, anchor=old_rule.anchor)  # sa
+          +me cadence unless asked otherwise                             
+      169 +        # A shift that lands on another day moves the weekly p
+          +attern (and its                                               
+      170 +        # cycle anchor) with it, unless the caller supplied a 
+          +different rule.                                               
+      171          day_shift = ((event.start + delta).date() - event.star
+           t.date()).days
+      169 -        rule = changes.get("rule", event.rule)                
+      170 -        if day_shift and rule == event.rule and rule and rule.
+          -freq is Freq.WEEKLY:                                          
+      171 -            changes["rule"] = replace(rule, byweekday=tuple((d
+          - + day_shift) % 7 for d in rule.byweekday))                   
+      172 +        if day_shift and rule == old_rule and rule and rule.fr
+          +eq is Freq.WEEKLY:                                            
+      173 +            rule = replace(                                   
+      174 +                rule,                                         
+      175 +                byweekday=tuple((d + day_shift) % 7 for d in r
+          +ule.byweekday),                                               
+      176 +                anchor=rule.anchor + timedelta(days=day_shift)
+          + if rule.anchor else None,                                    
+      177 +            )                                                 
+      178 +        changes["rule"] = rule                                
+      179          updated = _require_generates(replace(event, start=even
+           t.start + delta, **changes))
+      180          self.events[event.id] = updated
+      181          # Keep exceptions attached to the same (shifted) occur
+           rences; drop any
+  ⎿  Updated backend/calcore/store.py (+2 -0)
+      22          "interval": rule.interval,
+      23          "byweekday": list(rule.byweekday),
+      24          "until": rule.until.isoformat() if rule.until else None
+          ,
+      25 +        "anchor": rule.anchor.isoformat() if rule.anchor else N
+         +one,                                                           
+      26      }
+      27  
+      28  
+     ...
+      34          interval=d.get("interval", 1),
+      35          byweekday=tuple(d.get("byweekday", ())),
+      36          until=date.fromisoformat(d["until"]) if d.get("until") 
+          else None,
+      37 +        anchor=date.fromisoformat(d["anchor"]) if d.get("anchor
+         +") else None,                                                  
+      38      )
+      39  
+      40  
+
+⏺ now the oracle update plus the two new invariants:
+
+⏺ Bash(python3 - <<'EOF'
+      p='tests/test_properties.py'; s=open(p).read()…)
+  ⎿      |     # The test always failed when commented parts were varied to
+     gether.
+         |     # The test always failed when commented parts were varied to
+     … +4 lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_properties.py (+34 -1)
+      38      return Event("e", "T", start, draw(durations), draw(st.samp
+          led_from(ZONES)), rule)
+      39  
+      40  
+      41 +LONG = (datetime(2024, 1, 1, tzinfo=UTC), datetime(2030, 1, 1, 
+         +tzinfo=UTC))                                                   
+      42 +                                                               
+      43 +                                                               
+      44 +def local_starts(cal):                                         
+      45 +    return sorted(o.local_start for o in cal.occurrences(*LONG)
+         +)                                                              
+      46 +                                                               
+      47 +                                                               
+      48 +@given(events(), st.integers(-10, 10), st.integers(-3, 3), st.d
+         +ata())                                                         
+      49 +def test_shift_all_moves_every_occurrence_exactly(event, days, 
+         +hours, data):                                                  
+      50 +    # Regression: shifting a weekly interval>1 series across a 
+         +week boundary                                                  
+      51 +    # broke its cadence; also checks byweekday follows the shif
+         +t at all.                                                      
+      52 +    cal = Calendar()                                           
+      53 +    e = cal.add(event.title, event.start, event.duration, event
+         +.tz, event.rule)                                               
+      54 +    before = local_starts(cal)                                 
+      55 +    pick = data.draw(st.sampled_from(before[:50]))             
+      56 +    delta = timedelta(days=days, hours=hours)                  
+      57 +    cal.edit(e.id, pick, Scope.ALL, start=pick + delta)        
+      58 +    after = [s for s in local_starts(cal)]                     
+      59 +    expected = [s + delta for s in before if LONG[0] + timedelt
+         +a(days=12) < (s + delta).replace(tzinfo=UTC)                   
+      60 +                < LONG[1] - timedelta(days=12)]                
+      61 +    assert [s for s in after if LONG[0] + timedelta(days=12) < 
+         +s.replace(tzinfo=UTC) < LONG[1] - timedelta(days=12)] == expect
+         +ed                                                             
+      62 +                                                               
+      63 +                                                               
+      64 +@given(events(), st.data())                                    
+      65 +def test_noop_split_changes_nothing(event, data):              
+      66 +    cal = Calendar()                                           
+      67 +    e = cal.add(event.title, event.start, event.duration, event
+         +.tz, event.rule)                                               
+      68 +    before = [(o.local_start, o.duration) for o in cal.occurren
+         +ces(*LONG)]                                                    
+      69 +    pick = data.draw(st.sampled_from(before[:50]))[0]          
+      70 +    cal.edit(e.id, pick, Scope.FOLLOWING, title=event.title)   
+      71 +    assert [(o.local_start, o.duration) for o in cal.occurrence
+         +s(*LONG)] == before                                            
+      72 +                                                               
+      73 +                                                               
+      74  def oracle_dates(event, lo, hi):
+      75      """Walk every day and test the rule's definition directly."
+          ""
+      76      first, rule = event.start.date(), event.rule
+     ...
+      81          elif rule.until and d > rule.until:
+     … 7 more lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_service.py (+22 -0)
+      234      tail = cal.edit(series.id, datetime(2026, 11, 16, 9), Scop
+           e.FOLLOWING, start=datetime(2026, 11, 18, 9))
+      235      assert tail.rule.byweekday == (2,)
+      236      assert [o.local_start.day for o in week_of(cal)] == [2, 9,
+            18, 25]
+      237 +                                                              
+      238 +                                                              
+      239 +def test_shift_biweekly_across_week_boundary_keeps_cadence(cal
+          +):                                                            
+      240 +    # Regression: Sat+Sun every other week, moved +1 day, put 
+          +the Mondays in the                                            
+      241 +    # off weeks because cycles were always counted from a cale
+          +ndar Monday.                                                  
+      242 +    e = cal.add("wk", datetime(2026, 11, 7, 9), HOUR, "UTC", R
+          +ule(Freq.WEEKLY, 2, (5, 6)))                                  
+      243 +    cal.edit(e.id, datetime(2026, 11, 7, 9), Scope.ALL, start=
+          +datetime(2026, 11, 8, 9))                                     
+      244 +    got = [o.local_start.date() for o in week_of(cal, d0=date(
+          +2026, 11, 1), days=40)]                                       
+      245 +    assert got == [date(2026, 11, 8), date(2026, 11, 9), date(
+          +2026, 11, 22), date(2026, 11, 23),                            
+      246 +                   date(2026, 12, 6), date(2026, 12, 7)]      
+      247 +                                                              
+      248 +                                                              
+      249 +def test_rule_edit_with_same_interval_keeps_anchor(cal):      
+      250 +    e = cal.add("wk", datetime(2026, 11, 2, 9), HOUR, "UTC", R
+          +ule(Freq.WEEKLY, 2, (0,)))                                    
+      251 +    cal.edit(e.id, datetime(2026, 11, 16, 9), Scope.ALL, rule=
+          +Rule(Freq.WEEKLY, 2, (0, 2)))                                 
+      252 +    assert [o.local_start.day for o in week_of(cal)] == [2, 4,
+          + 16, 18]                                                      
+      253 +                                                              
+      254 +                                                              
+      255 +def test_sub_minute_durations_rejected(cal):                  
+      256 +    # Regression: the store writes whole minutes, so 90s silen
+          +tly became 60s.                                               
+      257 +    with pytest.raises(ValueError):                           
+      258 +        cal.add("x", datetime(2026, 11, 2, 9), timedelta(secon
+          +ds=90), "UTC")                                                
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Shifting a series past its until either errors or drops occurrences, so I'm
+  changing "move the whole series" to shift until by the same number of days;
+  tell me if you disagree. The -1h failure is probably my test, since a DST gap
+  time like 02:30 displays as 03:30, and I'm checking that first.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I've confirmed this is a genuine semantic edge case, not a bug: a monthly
+  series shifted by an hour lands on the 31st and skips short months. I'll
+  document that moving a monthly series adopts the new day-of-month, limit
+  time-only shifts for monthly events, and implement the until shift now.
+
+⏺ Bash(python3 - <<'EOF'
+      p='calcore/service.py'; s=open(p).read()…)
+  ⎿  E           ValueError: this recurrence produces no occurrences (check
+      the weekdays and until date)
+     E           Failing test case: test_shift_all_moves_every_occurrence_e
+     … +17 lines (ctrl+o to expand)
+  ⎿  Updated backend/calcore/service.py (+12 -9)
+      166              and rule.freq is old_rule.freq is Freq.WEEKLY and 
+           rule.interval == old_rule.interval
+      167          ):
+      168              rule = replace(rule, anchor=old_rule.anchor)  # sa
+           me cadence unless asked otherwise
+      169 -        # A shift that lands on another day moves the weekly p
+          -attern (and its                                               
+      170 -        # cycle anchor) with it, unless the caller supplied a 
+          -different rule.                                               
+      171 -        day_shift = ((event.start + delta).date() - event.star
+          -t.date()).days                                                
+      172 -        if day_shift and rule == old_rule and rule and rule.fr
+          -eq is Freq.WEEKLY:                                            
+      173 -            rule = replace(                                   
+      174 -                rule,                                         
+      175 -                byweekday=tuple((d + day_shift) % 7 for d in r
+          -ule.byweekday),                                               
+      176 -                anchor=rule.anchor + timedelta(days=day_shift)
+          - if rule.anchor else None,                                    
+      177 -            )                                                 
+      169 +        # A shift that lands on another day moves the whole pa
+          +ttern with it                                                 
+      170 +        # (until, and for weekly the weekdays and cycle anchor
+          +), unless the                                                 
+      171 +        # caller supplied a different rule. Monthly simply ado
+          +pts the new day.                                              
+      172 +        day_shift = timedelta(days=((event.start + delta).date
+          +() - event.start.date()).days)                                
+      173 +        if day_shift and rule == old_rule and rule:           
+      174 +            rule = replace(rule, until=rule.until + day_shift 
+          +if rule.until else None)                                      
+      175 +            if rule.freq is Freq.WEEKLY:                      
+      176 +                rule = replace(                               
+      177 +                    rule,                                     
+      178 +                    byweekday=tuple((d + day_shift.days) % 7 f
+          +or d in rule.byweekday),                                      
+      179 +                    anchor=rule.anchor + day_shift if rule.anc
+          +hor else None,                                                
+      180 +                )                                             
+      181          changes["rule"] = rule
+      182          updated = _require_generates(replace(event, start=even
+           t.start + delta, **changes))
+      183          self.events[event.id] = updated
+  ⎿  Updated backend/tests/test_properties.py (+11 -9)
+      3  from collections import Counter
+      4  from datetime import UTC, date, datetime, time, timedelta
+      5  
+      6 -from hypothesis import HealthCheck, given, settings             
+      6 +from hypothesis import HealthCheck, assume, given, settings     
+      7  from hypothesis import strategies as st
+      8  
+      9  from calcore.models import Event, Freq, Rule, Scope
+     ...
+      41  LONG = (datetime(2024, 1, 1, tzinfo=UTC), datetime(2030, 1, 1, 
+          tzinfo=UTC))
+      42  
+      43  
+      44 -def local_starts(cal):                                         
+      45 -    return sorted(o.local_start for o in cal.occurrences(*LONG)
+         -)                                                              
+      44 +def original_starts(cal):                                      
+      45 +    """Wall-clock keys (gap times stay as written, e.g. 02:30).
+         +"""                                                            
+      46 +    return sorted(o.original_start for o in cal.occurrences(*LO
+         +NG))                                                           
+      47  
+      48  
+      49  @given(events(), st.integers(-10, 10), st.integers(-3, 3), st.d
+          ata())
+      50  def test_shift_all_moves_every_occurrence_exactly(event, days, 
+          hours, data):
+      51      # Regression: shifting a weekly interval>1 series across a 
+          week boundary
+      51 -    # broke its cadence; also checks byweekday follows the shif
+         -t at all.                                                      
+      52 +    # broke its cadence; also checks byweekday and until follow
+         + the shift.                                                    
+      53      cal = Calendar()
+      54      e = cal.add(event.title, event.start, event.duration, event
+          .tz, event.rule)
+      54 -    before = local_starts(cal)                                 
+      55 +    before = original_starts(cal)                              
+      56      pick = data.draw(st.sampled_from(before[:50]))
+      57      delta = timedelta(days=days, hours=hours)
+      58 +    if event.rule and event.rule.freq is Freq.MONTHLY:         
+      59 +        # day-of-month can't shift exactly (months differ); onl
+         +y same-day moves                                               
+      60 +        assume((pick + delta).date() == pick.date())           
+      61      cal.edit(e.id, pick, Scope.ALL, start=pick + delta)
+      58 -    after = [s for s in local_starts(cal)]                     
+      59 -    expected = [s + delta for s in before if LONG[0] + timedelt
+         -a(days=12) < (s + delta).replace(tzinfo=UTC)                   
+      60 -                < LONG[1] - timedelta(days=12)]                
+      61 -    assert [s for s in after if LONG[0] + timedelta(days=12) < 
+         -s.replace(tzinfo=UTC) < LONG[1] - timedelta(days=12)] == expect
+         -ed                                                             
+      62 +    inner = lambda s: datetime(2024, 2, 1) < s < datetime(2029,
+         + 12, 1)                                                        
+      63 +    assert [s for s in original_starts(cal) if inner(s)] == [s 
+         ++ delta for s in before if inner(s + delta)]                   
+      64  
+     … 2 more lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_service.py (+6 -0)
+      256      # Regression: the store writes whole minutes, so 90s silen
+           tly became 60s.
+      257      with pytest.raises(ValueError):
+      258          cal.add("x", datetime(2026, 11, 2, 9), timedelta(secon
+           ds=90), "UTC")
+      259 +                                                              
+      260 +                                                              
+      261 +def test_shift_all_moves_until_with_it(cal):                  
+      262 +    e = cal.add("x", datetime(2026, 11, 2, 9), HOUR, "UTC", Ru
+          +le(Freq.WEEKLY, byweekday=(0,), until=date(2026, 11, 16)))    
+      263 +    cal.edit(e.id, e.start, Scope.ALL, start=datetime(2026, 11
+          +, 3, 9))                                                      
+      264 +    assert [o.local_start.day for o in week_of(cal)] == [3, 10
+          +, 17]                                                         
+  ⎿  (timeout 10m)
+
+⏺ that's the generator, not the code: it builds empty rules, which add now
+  correctly rejects. filtering them out in the service-level properties:
+
+⏺ Bash(python3 - <<'EOF'
+      p='tests/test_properties.py'; s=open(p).read()…)
+  ⎿  E           calcore.service.NotFound: "event '08994f7c' has no occurre
+     nce at 2025-03-30T02:00:00"
+     E           Failing test case: test_noop_split_changes_nothing(
+     … +18 lines (ctrl+o to expand)
+  ⎿  Updated backend/tests/test_properties.py (+3 -1)
+       7  from hypothesis import strategies as st
+       8  
+       9  from calcore.models import Event, Freq, Rule, Scope
+      10 -from calcore.recurrence import candidate_dates, expand, is_occu
+         -rrence                                                         
+      10 +from calcore.recurrence import candidate_dates, expand, first_o
+         +ccurrence, is_occurrence                                       
+      11  from calcore.service import Calendar
+      12  from calcore.store import JsonStore
+      13  
+     ...
+      50  def test_shift_all_moves_every_occurrence_exactly(event, days, 
+          hours, data):
+      51      # Regression: shifting a weekly interval>1 series across a 
+          week boundary
+      52      # broke its cadence; also checks byweekday and until follow
+           the shift.
+      53 +    assume(first_occurrence(event))                            
+      54      cal = Calendar()
+      55      e = cal.add(event.title, event.start, event.duration, event
+          .tz, event.rule)
+      56      before = original_starts(cal)
+     ...
+      66  
+      67  @given(events(), st.data())
+      68  def test_noop_split_changes_nothing(event, data):
+      69 +    assume(first_occurrence(event))                            
+      70      cal = Calendar()
+      71      e = cal.add(event.title, event.start, event.duration, event
+          .tz, event.rule)
+      72      before = [(o.local_start, o.duration) for o in cal.occurren
+          ces(*LONG)]
+  ⎿  (timeout 10m)
+
+⏺ a test bug again: i picked the displayed local_start (02:00) instead of the
+  key original_start (01:00, a london gap time). the UI correctly uses
+  original_start, so no app impact:
+
+⏺ Bash(python3 - <<'EOF'
+      p='tests/test_properties.py'; s=open(p).read()…)
+  ⎿  78 passed, 1 warning in 30.09s
+  ⎿  Updated backend/tests/test_properties.py (+2 -2)
+      69      assume(first_occurrence(event))
+      70      cal = Calendar()
+      71      e = cal.add(event.title, event.start, event.duration, event
+          .tz, event.rule)
+      72 -    before = [(o.local_start, o.duration) for o in cal.occurren
+         -ces(*LONG)]                                                    
+      72 +    before = [(o.original_start, o.start, o.duration) for o in 
+         +cal.occurrences(*LONG)]                                        
+      73      pick = data.draw(st.sampled_from(before[:50]))[0]
+      74      cal.edit(e.id, pick, Scope.FOLLOWING, title=event.title)
+      75 -    assert [(o.local_start, o.duration) for o in cal.occurrence
+         -s(*LONG)] == before                                            
+      75 +    assert [(o.original_start, o.start, o.duration) for o in ca
+         +l.occurrences(*LONG)] == before                                
+      76  
+      77  
+      78  def oracle_dates(event, lo, hi):
+  ⎿  (timeout 10m)
+
+⏺ The heavy test run passed cleanly: 78 tests at 5,000 examples per property.
+  I'm moving on to the backend extensions, starting with conflict detection,
+  working hours, and suggestions.
+
+⏺ Write(backend/calcore/scheduling.py)
+  ⎿  Wrote 177 lines to backend/calcore/scheduling.py
+      1 from __future__ import annotations
+      2 
+      3 from collections.abc import Iterable
+      4 from dataclasses import dataclass
+      5 from datetime import UTC, datetime, time, timedelta
+      6 from zoneinfo import ZoneInfo
+      7 
+      8 from .models import Occurrence
+      9 from .recurrence import localize
+     … +168 lines (ctrl+o to expand)
+
+⏺ now persistence, service, and API wiring:
+
+⏺ Bash(python3 - <<'EOF'
+      p='calcore/store.py'; s=open(p).read()…)
+  ⎿  1:from __future__ import annotations
+     3:import uuid
+     4:from collections.abc import Iterator
+     … +9 lines (ctrl+o to expand)
+  ⎿  Updated backend/calcore/service.py (+21 -3)
+       9  
+      10  from .models import Event, EventException, Freq, Occurrence, Ru
+          le, Scope
+      11  from .recurrence import expand, first_occurrence, is_occurrence
+      12 +from .scheduling import Conflict, Slot, WorkingHours, find_conf
+         +licts, suggest                                                 
+      13  from .store import JsonStore
+      14  
+      15  _UNSET: Any = object()
+     ...
+      49          self.store = store
+      50          self.events: dict[str, Event] = {}
+      51          self.exceptions: dict[str, dict[datetime, EventExceptio
+          n]] = {}
+      52 +        self.working_hours: WorkingHours | None = None         
+      53          if store:
+      52 -            events, exceptions = store.load()                  
+      54 +            events, exceptions, self.working_hours = store.load
+         +()                                                             
+      55              for e in events:
+      56                  self.events[e.id] = e
+      57                  self.exceptions[e.id] = {}
+     ...
+       81          out.sort(key=lambda o: (o.start, o.end, o.title))
+       82          return out
+       83  
+       84 +    def conflicts(self, window_start: datetime, window_end: da
+          +tetime) -> list[Conflict]:                                    
+       85 +        return find_conflicts(self.occurrences(window_start, w
+          +indow_end))                                                   
+       86 +                                                              
+       87 +    def suggest(                                              
+       88 +        self, duration: timedelta, window_start: datetime, win
+          +dow_end: datetime, limit: int = 8                             
+       89 +    ) -> tuple[list[Slot], list[Slot]]:                       
+       90 +        """Recommended meeting slots and free gaps within work
+          +ing hours."""                                                 
+       91 +        hours = self.working_hours or WorkingHours.default()  
+       92 +        busy = self.occurrences(window_start, window_end)     
+       93 +        return suggest(busy, hours, duration, window_start, wi
+          +ndow_end, limit=limit)                                        
+       94 +                                                              
+       95      # -- mutations -------------------------------------------
+           --------------
+       96  
+       97 +    def set_working_hours(self, hours: WorkingHours) -> None: 
+       98 +        with self._transaction():                             
+       99 +            self.working_hours = hours                        
+      100 +                                                              
+      101      def add(
+      102          self, title: str, start: datetime, duration: timedelta
+           , tz: str, rule: Rule | None = None
+      103      ) -> Event:
+     … 17 more lines (ctrl+o to expand)
+  ⎿  Updated backend/calcore/store.py (+30 -5)
+       3  import json
+       4  import os
+       5  import tempfile
+       6 -from datetime import date, datetime, timedelta                 
+       6 +from datetime import date, datetime, time, timedelta           
+       7  from pathlib import Path
+       8  from typing import Any
+       9  
+      10  from .models import Event, EventException, Rule
+      11 +from .scheduling import WorkingHours                           
+      12  
+      13  
+      14  def _minutes(td: timedelta) -> int:
+     ...
+       83      )
+       84  
+       85  
+       86 +def hours_to_dict(h: WorkingHours) -> dict[str, Any]:         
+       87 +    return {                                                  
+       88 +        "tz": h.tz,                                           
+       89 +        "days": [                                             
+       90 +            {"start": d[0].strftime("%H:%M"), "end": d[1].strf
+          +time("%H:%M")} if d else None                                 
+       91 +            for d in h.days                                   
+       92 +        ],                                                    
+       93 +    }                                                         
+       94 +                                                              
+       95 +                                                              
+       96 +def hours_from_dict(d: dict[str, Any]) -> WorkingHours:       
+       97 +    return WorkingHours(                                      
+       98 +        tz=d["tz"],                                           
+       99 +        days=tuple(                                           
+      100 +            (time.fromisoformat(x["start"]), time.fromisoforma
+          +t(x["end"])) if x else None                                   
+      101 +            for x in d["days"]                                
+      102 +        ),                                                    
+      103 +    )                                                         
+      104 +                                                              
+      105 +                                                              
+      106  class JsonStore:
+      107      """Whole-file JSON persistence. Writes are atomic (temp fi
+           le + rename)."""
+      108  
+      109      def __init__(self, path: str | Path) -> None:
+     … 25 more lines (ctrl+o to expand)
+
+⏺ Bash(python3 - <<'EOF'
+      p='api.py'; s=open(p).read()…)
+  ⎿  ok
+  ⎿  Updated backend/api.py (+81 -2)
+       1  from __future__ import annotations
+       2  
+       3  import os
+       4 -from datetime import date, datetime, timedelta                 
+       4 +from datetime import date, datetime, time, timedelta           
+       5  from typing import Any
+       6  
+       7  from fastapi import FastAPI, Request
+       8  from fastapi.responses import JSONResponse
+       9 +from zoneinfo import ZoneInfo                                  
+      10  from pydantic import BaseModel, Field
+      11  
+      12  from calcore.models import Freq, Occurrence, Rule, Scope
+      13  from calcore.service import Calendar, NotFound
+      13 -from calcore.store import JsonStore, event_to_dict, rule_to_dic
+         -t                                                              
+      14 +from calcore.scheduling import Conflict, Slot, WorkingHours    
+      15 +from calcore.store import JsonStore, event_to_dict, hours_from_
+         +dict, hours_to_dict, rule_to_dict                              
+      16 +                                                               
+      17 +MAX_SUGGEST_WINDOW = timedelta(days=62)                        
+      18  
+      19  
+      20  class RuleIn(BaseModel):
+     ...
+      62          return out
+      63  
+      64  
+      65 +class DayHoursIn(BaseModel):                                   
+      66 +    start: time                                                
+      67 +    end: time                                                  
+      68 +                                                               
+      69 +                                                               
+      70 +class WorkingHoursIn(BaseModel):                               
+      71 +    tz: str                                                    
+      72 +    days: list[DayHoursIn | None] = Field(min_length=7, max_len
+         +gth=7)                                                         
+      73 +                                                               
+      74 +    def to_hours(self) -> WorkingHours:                        
+      75 +        return WorkingHours(self.tz, tuple((d.start, d.end) if 
+         +d else None for d in self.days))                               
+      76 +                                                               
+      77 +                                                               
+      78  def create_app(cal: Calendar) -> FastAPI:
+      79      app = FastAPI(title="Calendar")
+     … 69 more lines (ctrl+o to expand)
+
+⏺ adding scheduling tests: unit cases, a brute-force all-pairs oracle for
+  conflicts, and properties for suggestions (inside working hours, never
+  overlapping busy time, aligned, earliest per gap):
+
+⏺ Bash(sed -i '' 's/from calcore.store import JsonStore, event_to_dict,
+      hours_from_dict, hours_to_dict, rule_to_dict/from calcore.store import
+      JsonStore, event_to_dict…)
+  ⎿  97 passed, 1 warning in 2.07s
+  ⎿  Updated backend/api.py (+1 -1)
+      12  from calcore.models import Freq, Occurrence, Rule, Scope
+      13  from calcore.service import Calendar, NotFound
+      14  from calcore.scheduling import Conflict, Slot, WorkingHours
+      15 -from calcore.store import JsonStore, event_to_dict, hours_from_
+         -dict, hours_to_dict, rule_to_dict                              
+      15 +from calcore.store import JsonStore, event_to_dict, hours_to_di
+         +ct, rule_to_dict                                               
+      16  
+      17  MAX_SUGGEST_WINDOW = timedelta(days=62)
+      18  
+  ⎿  Updated backend/tests/test_api.py (+33 -0)
+      102  def test_rejects_bad_windows(client, window):
+      103      create_series(client)
+      104      assert client.get("/api/occurrences", params=window).statu
+           s_code == 400
+      105 +                                                              
+      106 +                                                              
+      107 +def test_conflicts_endpoint(client):                          
+      108 +    create_series(client)                                     
+      109 +    client.post("/api/events", json={"title": "Dentist", "star
+          +t": "2026-11-04T09:15", "duration": 60,                       
+      110 +                                     "tz": "America/New_York"}
+          +)                                                             
+      111 +    (c,) = client.get("/api/conflicts", params=WEEK).json()   
+      112 +    assert c["a"]["title"] == "Standup" and c["b"]["title"] ==
+          + "Dentist"                                                    
+      113 +    assert c["minutes"] == 15                                 
+      114 +    assert c["a"]["original_start"] == "2026-11-04T09:00:00"  
+      115 +    assert "overlaps" in c["message"]                         
+      116 +                                                              
+      117 +                                                              
+      118 +def test_working_hours_and_suggestions(client):               
+      119 +    got = client.get("/api/working-hours").json()             
+      120 +    assert got["saved"] is False and got["days"][0] == {"start
+          +": "09:00", "end": "17:00"} and got["days"][5] is None        
+      121 +    hours = {"tz": "America/New_York", "days": [{"start": "09:
+          +00", "end": "17:00"}] * 5 + [None, None]}                     
+      122 +    assert client.put("/api/working-hours", json=hours).json()
+          +["saved"] is True                                             
+      123 +    create_series(client)  # 09:00-09:30 M/W/F                
+      124 +    r = client.get("/api/suggestions", params={"duration": 60,
+          + **WEEK, "limit": 3}).json()                                  
+      125 +    assert [s["local_start"] for s in r["slots"]] == [        
+      126 +        "2026-11-02T09:30:00", "2026-11-03T09:00:00", "2026-11
+          +-04T09:30:00",                                                
+      127 +    ]                                                         
+      128 +    assert r["slots"][0]["start"] == "2026-11-02T09:30:00-05:0
+          +0"                                                            
+      129 +                                                              
+      130 +                                                              
+      131 +def test_suggestion_validation(client):                       
+      132 +    bad = {"tz": "UTC", "days": [{"start": "17:00", "end": "09
+          +:00"}] + [None] * 6}                                          
+      133 +    assert client.put("/api/working-hours", json=bad).status_c
+          +ode == 400                                                    
+      134 +    assert client.put("/api/working-hours", json={"tz": "UTC",
+          + "days": [None] * 6}).status_code == 422                      
+      135 +    assert client.get("/api/suggestions", params={"duration": 
+          +0, **WEEK}).status_code == 400                                
+      136 +    assert client.get("/api/suggestions", params={"duration": 
+          +30, "start": WEEK["start"],                                   
+      137 +                                                  "end": "2027
+          +-11-02T00:00:00-05:00"}).status_code == 400                   
+  ⎿  Created backend/tests/test_scheduling.py (+193 -0)
+        1 +from datetime import UTC, date, datetime, time, timedelta     
+        2 +from zoneinfo import ZoneInfo                                 
+        3 +                                                              
+        4 +import pytest                                                 
+        5 +from hypothesis import given                                  
+        6 +from hypothesis import strategies as st                       
+        7 +                                                              
+        8 +from calcore.models import Freq, Occurrence, Rule             
+        9 +from calcore.scheduling import WorkingHours, find_conflicts, f
+          +ree_gaps, suggest                                             
+       10 +from calcore.service import Calendar                          
+       11 +from calcore.store import JsonStore                           
+       12 +                                                              
+       13 +NY = ZoneInfo("America/New_York")                             
+       14 +TZ = "America/New_York"                                       
+       15 +MIN = timedelta(minutes=1)                                    
+       16 +                                                              
+       17 +                                                              
+       18 +def at(d, h, m=0):                                            
+       19 +    return datetime(2026, 11, d, h, m)                        
+       20 +                                                              
+       21 +                                                              
+       22 +def ny(d, h, m=0):                                            
+       23 +    return datetime(2026, 11, d, h, m, tzinfo=NY).astimezone(U
+          +TC)                                                           
+       24 +                                                              
+       25 +                                                              
+       26 +def week(d0=2):                                               
+       27 +    return ny(d0, 0), ny(d0 + 7, 0)                           
+       28 +                                                              
+       29 +                                                              
+       30 +@pytest.fixture                                               
+       31 +def cal():                                                    
+       32 +    return Calendar()                                         
+       33 +                                                              
+       34 +                                                              
+       35 +# -- conflicts -----------------------------------------------
+          +--------------------                                          
+       36 +                                                              
+       37 +                                                              
+       38 +def test_no_conflicts_when_touching(cal):                     
+       39 +    cal.add("A", at(2, 9), timedelta(hours=1), TZ)            
+       40 +    cal.add("B", at(2, 10), timedelta(hours=1), TZ)           
+     … 153 more lines (ctrl+o to expand)
+
+⏺ all 97 pass. heavy run on the new properties too:
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The backend is finished. I'm moving on to the UI: conflict markers and a
+  panel, a "find a time" dialog with a working-hours editor, a heads-up after
+  saving into a conflict, and weekday toggles that follow the date.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Bash(cd /Users/paulyoon/Projects/numenor-take-home/web && python3 - <<'EOF'
+      p='app/lib/api.ts'; s=open(p).read()…)
+  ⎿  68:export interface SavedEvent {
+     114:    call<SavedEvent>("/api/events", { method: "POST", body: JSON.s
+     tringify(fields) }),
+     … +2 lines (ctrl+o to expand)
+  ⎿  Updated web/app/lib/api.ts (+62 -6)
+       6    interval: number;
+       7    byweekday: number[]; // 0=Mon..6=Sun
+       8    until: string | null; // YYYY-MM-DD, inclusive
+       9 +  anchor?: string | null; // weekly cycle start; server-managed
+      10  }
+      11  
+      12  export interface Occurrence {
+     ...
+      23    rule: Rule | null;
+      24  }
+      25  
+      26 +export interface OccurrenceRef {                               
+      27 +  event_id: string;                                            
+      28 +  original_start: string;                                      
+      29 +  title: string;                                               
+      30 +  start: string;                                               
+      31 +  end: string;                                                 
+      32 +}                                                              
+      33 +                                                               
+      34 +export interface Conflict {                                    
+      35 +  a: OccurrenceRef;                                            
+      36 +  b: OccurrenceRef;                                            
+      37 +  start: string; // overlap, UTC ISO                           
+      38 +  end: string;                                                 
+      39 +  minutes: number;                                             
+      40 +  message: string;                                             
+      41 +}                                                              
+      42 +                                                               
+      43 +export interface DayHours {                                    
+      44 +  start: string; // HH:MM                                      
+      45 +  end: string;                                                 
+      46 +}                                                              
+      47 +                                                               
+      48 +export interface WorkingHours {                                
+      49 +  saved?: boolean;                                             
+      50 +  tz: string;                                                  
+      51 +  days: (DayHours | null)[]; // Mon..Sun                       
+      52 +}                                                              
+      53 +                                                               
+      54 +export interface Slot {                                        
+      55 +  start: string; // aware ISO in working-hours tz              
+     … 56 more lines (ctrl+o to expand)
+
+⏺ Write(web/app/components/FindTimeDialog.tsx)
+  ⎿  Wrote 192 lines to web/app/components/FindTimeDialog.tsx
+       1 "use client";
+       2 
+       3 import { useEffect, useMemo, useState } from "react";
+       4 import { api, type Slot, type Suggestions, type WorkingHours } f
+         rom "../lib/api";
+       5 import { addDays, browserTz, fmtTime } from "../lib/dates";
+       6 
+       7 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun
+         "];
+       8 const LENGTHS = [15, 30, 45, 60, 90, 120];
+     … +184 lines (ctrl+o to expand)
+
+⏺ now wiring conflicts and find-a-time into the main view, plus the dialog
+  changes:
+
+⏺ Bash(python3 - <<'EOF'
+      p='app/components/CalendarApp.tsx'; s=open(p).read()…)
+  ⎿  tsc ok
+  ⎿  Updated web/app/components/CalendarApp.tsx (+99 -9)
+       1  "use client";
+       2  
+       3  import { useCallback, useEffect, useMemo, useRef, useState } fr
+          om "react";
+       4 -import { api, type EventFields, type Occurrence, type Scope } f
+         -rom "../lib/api";                                              
+       4 +import { api, type Conflict, type EventFields, type Occurrence,
+         + type Scope, type Slot } from "../lib/api";                    
+       5  import {
+       6    addDays, browserTz, fmtTime, hueFor, isoDate, isoTime, layout
+          Day, minutesIntoDay, sameDay, startOfWeek,
+       7  } from "../lib/dates";
+       8  import { EventDialog, type DialogState } from "./EventDialog";
+       9 +import { FindTimeDialog } from "./FindTimeDialog";             
+      10  
+      11  const HOUR_PX = 48;
+      12  const PX_PER_MIN = HOUR_PX / 60;
+      13  
+      14 +const occKey = (o: { event_id: string; original_start: string }
+         +) => `${o.event_id}|${o.original_start}`;                      
+      15 +                                                               
+      16  interface Menu {
+      17    x: number;
+      18    y: number;
+     ...
+      22  export default function CalendarApp() {
+      23    const [weekStart, setWeekStart] = useState(() => startOfWeek(
+          new Date()));
+      24    const [occs, setOccs] = useState<Occurrence[]>([]);
+      25 +  const [conflicts, setConflicts] = useState<Conflict[]>([]);  
+      26 +  const [showConflicts, setShowConflicts] = useState(false);   
+      27 +  const [findTime, setFindTime] = useState(false);             
+      28 +  const [notice, setNotice] = useState<string | null>(null);   
+      29    const [error, setError] = useState<string | null>(null);
+      30    const [dialog, setDialog] = useState<DialogState | null>(null
+          );
+      31    const [menu, setMenu] = useState<Menu | null>(null);
+     ...
+      35  
+      36    const days = useMemo(() => Array.from({ length: 7 }, (_, i) =
+          > addDays(weekStart, i)), [weekStart]);
+      37  
+      31 -  const reload = useCallback(async () => {                     
+      38 +  const reload = useCallback(async (): Promise<Conflict[]> => {
+      39      try {
+      33 -      setOccs(await api.occurrences(weekStart, addDays(weekStar
+         -t, 7)));                                                       
+      40 +      const end = addDays(weekStart, 7);                       
+      41 +      const [o, c] = await Promise.all([api.occurrences(weekSta
+         +rt, end), api.conflicts(weekStart, end)]);                     
+      42 +      setOccs(o);                                              
+      43 +      setConflicts(c);                                         
+     … 152 more lines (ctrl+o to expand)
+  ⎿  Updated web/app/components/EventDialog.tsx (+13 -3)
+       7  const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Su
+          n"];
+       8  
+       9  export type DialogState =
+      10 -  | { mode: "create"; date: string; time: string; tz: string } 
+      10 +  | { mode: "create"; date: string; time: string; tz: string; d
+         +uration?: number }                                             
+      11    | { mode: "edit"; occ: Occurrence };
+      12  
+      13  interface Props {
+     ...
+      26    const [title, setTitle] = useState(occ?.title ?? "");
+      27    const [date, setDate] = useState(init.date);
+      28    const [time, setTime] = useState(init.time);
+      29 -  const [duration, setDuration] = useState(occ?.duration ?? 60)
+         -;                                                              
+      29 +  const [duration, setDuration] = useState(occ?.duration ?? (st
+         +ate.mode === "create" ? state.duration : undefined) ?? 60);    
+      30    const [tz, setTz] = useState(init.tz);
+      31    const [repeat, setRepeat] = useState<"none" | Freq>(occ?.rule
+          ?.freq ?? "none");
+      32    const [interval, setRuleInterval] = useState(occ?.rule?.inter
+          val ?? 1);
+     ...
+      42    const recurring = !!occ?.recurring;
+      43    const seriesLocked = recurring && scope === "this";
+      44  
+      45 +  // Moving the date moves the weekly pattern with it (Mon -> T
+         +ue shifts every                                                
+      46 +  // selected weekday by one), matching how the server shifts a
+         + series.                                                       
+      47 +  const changeDate = (next: string) => {                       
+      48 +    if (date && next && repeat === "WEEKLY" && !seriesLocked) {
+      49 +      const shift = (weekdayOf(next) - weekdayOf(date) + 7) % 7
+         +;                                                              
+      50 +      if (shift) setByweekday((cur) => cur.map((d) => (d + shif
+         +t) % 7).sort());                                               
+      51 +    }                                                          
+      52 +    setDate(next);                                             
+      53 +  };                                                           
+      54 +                                                               
+      55    const toggleDay = (d: number) =>
+      56      setByweekday((cur) => (cur.includes(d) ? cur.filter((x) => 
+          x !== d) : [...cur, d].sort()));
+      57  
+     ...
+      101          <div className="row">
+      102            <label>
+      103              Date
+       94 -            <input type="date" required value={date} onChange=
+          -{(e) => setDate(e.target.value)} />                           
+      104 +            <input type="date" required value={date} onChange=
+          +{(e) => changeDate(e.target.value)} />                        
+      105            </label>
+      106            <label>
+      107              Start
+  ⎿  Updated web/app/globals.css (+37 -0)
+      160    .grid-head, .grid { grid-template-columns: 40px repeat(7, mi
+           nmax(44px, 1fr)); }
+      161    .day-head { flex-direction: column; gap: 0; padding: 6px 4px
+           ; }
+      162  }
+      163 +                                                              
+      164 +/* conflicts + find a time */                                 
+      165 +.event.conflict { box-shadow: inset 0 0 0 1.5px var(--danger);
+          + }                                                            
+      166 +.conflict-pill { font-size: 13px; color: var(--muted); }      
+      167 +.conflict-pill.has { color: var(--danger); border-color: color
+          +-mix(in srgb, var(--danger) 45%, var(--line-strong)); font-wei
+          +ght: 500; }                                                   
+      168 +button.link { border: none; background: none; padding: 0 4px; 
+          +color: var(--accent); font-size: 13px; }                      
+      169 +.banner.warn {                                                
+      170 +  background: color-mix(in srgb, #e0a100 14%, var(--bg)); colo
+          +r: var(--text);                                               
+      171 +  display: flex; gap: 8px; align-items: center;               
+      172 +}                                                             
+      173 +.conflicts {                                                  
+      174 +  position: fixed; right: 16px; top: 64px; z-index: 15; width:
+          + min(360px, calc(100vw - 32px));                              
+      175 +  max-height: calc(100vh - 96px); overflow-y: auto;           
+      176 +  background: var(--surface); border: 1px solid var(--line-str
+          +ong); border-radius: 10px;                                    
+      177 +  box-shadow: var(--shadow); padding: 12px;                   
+      178 +}                                                             
+      179 +.conflicts-head { display: flex; justify-content: space-betwee
+          +n; align-items: center; margin-bottom: 8px; }                 
+      180 +.conflicts ul { list-style: none; margin: 0; padding: 0; displ
+          +ay: flex; flex-direction: column; gap: 4px; }                 
+      181 +.conflicts li button {                                        
+      182 +  width: 100%; text-align: left; border: none; border-left: 3p
+          +x solid var(--danger);                                        
+      183 +  border-radius: 4px; background: var(--bg); padding: 8px 10px
+          +;                                                             
+      184 +  display: flex; flex-direction: column; gap: 2px; font-size: 
+          +13px;                                                         
+      185 +}                                                             
+      186 +.conflicts li button:hover { background: var(--line); }       
+      187 +.conflicts .when { color: var(--muted); font-size: 12px; font-
+          +variant-numeric: tabular-nums; }                              
+      188 +.dialog.wide { width: min(560px, 100%); }                     
+      189 +.dialog .hours { gap: 6px; }                                  
+      190 +.dialog .hours legend { display: flex; align-items: center; } 
+      191 +.hours-row { display: flex; align-items: center; gap: 8px; }  
+      192 +.hours-row .day-name { width: 32px; }                         
+      193 +.hours-row input[type="time"] { width: 120px; }               
+      194 +.results { display: flex; flex-direction: column; gap: 12px; m
+          +ax-height: 340px; overflow-y: auto; }                         
+      195 +.result-day { display: flex; flex-direction: column; gap: 6px;
+          + }                                                            
+      196 +.result-date { font-weight: 600; font-size: 13px; }           
+      197 +.result-slots { display: flex; flex-wrap: wrap; gap: 6px; }   
+      198 +.slot { font-variant-numeric: tabular-nums; border-color: var(
+          +--accent); color: var(--accent); }                            
+      199 +.slot:hover { background: var(--accent); color: var(--accent-t
+          +ext); }                                                       
+
+⏺ type-check passes. restarting the API on the new code, reseeding, and driving
+  the new flows end to end, including your bug repro through the actual UI:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All the flows checked out: the monday-to-tuesday series edit sticks with the
+  weekday toggles, conflicts and find-a-time behave correctly, and the heads-up
+  notice fires on a clash. I'm checking the screenshots next.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Both screenshots look correct: the suggestions account for the moved Friday
+  standup and the relocated Tuesday "weekly sync," and the three-way Thursday
+  overlap shows in three columns with conflict rings. I'm now updating the
+  README with the new features, semantic changes, and bug log.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Bash(python3 - <<'EOF'
+      p='README.md'; s=open(p).read()…)
+  ⎿  97 passed, 1 warning in 1.97s
+     ○  (Static)  prerendered as static content
+     … +5 lines (ctrl+o to expand)
+  ⎿  Updated README.md (+63 -12)
+       7    calcore/models.py      Event, Rule, EventException, Occurrenc
+          e
+       8    calcore/recurrence.py  rule expansion, exception application,
+           DST handling
+       9    calcore/service.py     Calendar: add / edit / cancel with thi
+          s|following|all scopes
+      10 +  calcore/scheduling.py  conflict detection, working hours, fre
+         +e-slot suggestions                                             
+      11    calcore/store.py       JSON file persistence (atomic writes)
+      12    api.py                 FastAPI routes
+      13    seed.py                demo data around the current week
+      13 -  tests/                 pytest suite                          
+      14 -web/                     Next.js app (week grid, create/edit di
+         -alog, right-click menu)                                        
+      14 +  tests/                 pytest + hypothesis suite             
+      15 +web/                     Next.js app (week grid, create/edit di
+         +alog, right-click menu,                                        
+      16 +                         conflicts panel, find-a-time dialog)  
+      17  ```
+      18  
+      19  ## Running
+     ...
+      39  - **Edit / reschedule:** click an event. For recurring events, 
+          pick *This event*, *This and following*, or *All events*.
+      40  - **Cancel:** right-click an event, or use Delete in the edit d
+          ialog.
+      41  - **Navigate:** use ‹ / › / Today to move between weeks. The gr
+          id scrolls vertically through the day.
+      42 +- **Conflicts:** overlapping events get a red ring and a ⚠. The
+         + toolbar pill opens a panel explaining each overlap for the wee
+         +k. Saving an event that clashes shows a heads-up.              
+      43 +- **Find a time:** pick a meeting length and range. Working hou
+         +rs default to Mon-Fri 9-5 in your time zone, can be edited inli
+         +ne, and are saved on search. Click a suggestion to open a prefi
+         +lled new event.                                                
+      44  
+      45  Data lives in `backend/data/calendar.json` (override with `CALE
+          NDAR_DB`). The API loads it at startup, so restart the API afte
+          r running `seed.py`.
+      46  
+      47  Tests:
+      48  
+      49  ```sh
+      46 -cd backend && uv run pytest                                    
+      50 +cd backend && uv run pytest                              # ~2s 
+      51 +cd backend && HYPOTHESIS_PROFILE=heavy uv run pytest     # ~35s
+         +, 5000 examples per property                                   
+      52  ```
+      53  
+      54  ## Data model
+      55  
+      56  ```
+      57  Event(id, title, start, duration, tz, rule=None)
+      53 -Rule(freq: WEEKLY|MONTHLY, interval=1, byweekday=(), until: dat
+         -e|None)                                                        
+      58 +Rule(freq: WEEKLY|MONTHLY, interval=1, byweekday=(), until: dat
+         +e|None, anchor: date|None)                                     
+      59  EventException(event_id, original_start, cancelled=False, title
+          =None, start=None, duration=None)
+      60  ```
+      61  
+     … 97 more lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+⏺ next build writes to the same .next directory the dev server uses, so i'm
+  checking the dev server survived:
+
+  Ran 2 shell commands (ctrl+o to expand)
+  ⎿  PreToolUse:Bash says: rm intercepted -> redirected to trash
+
+⏺ back up. reseeding so you start from clean demo data instead of my test
+  events:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ your bug is fixed, conflict detection and meeting recommendations are built,
+  and stress testing turned up 7 more bugs. all 97 tests pass, including a heavy
+  run at 5000 random examples per property. i also clicked through every new
+  flow in headless chromium with no console errors, and your repro now works
+  through the UI. both servers are running on fresh demo data at
+  http://localhost:3000. nothing is committed yet.
+
+  your bug
+  an "all" edit moved the series start to tuesday but left byweekday at monday.
+  it was worse than it looked: the shifted exceptions landed on tuesdays the
+  rule never generates, so they were silently deleted as orphans. now a day
+  shift moves byweekday with it, and the dialog's weekday toggles follow the
+  date so you see the change before saving.
+
+  decisions for you to check (my calls, each one changes behavior):
+  - the whole pattern shifts. moving the monday occurrence of a MWF series to
+    tuesday gives tue/thu/sat, not tue/wed/fri. that keeps everything consistent
+    with how exceptions move.
+  - until shifts too, so the series keeps the same number of occurrences.
+  - monthly series take the new day. a monthly series moved to another day uses
+    the new day-of-month, since months differ in length.
+  - every-other-week series now store a cycle start date (anchor). without it,
+    shifting a sat+sun biweekly series by a day put the mondays in the off
+    weeks. the server manages it and the UI never sends it.
+
+  conflict detection
+  - overlapping events get a red ring and a ⚠ in the grid.
+  - a toolbar pill opens a panel that explains each overlap, e.g. "Lunch w/ 
+    team" overlaps "Design review" (30 min of overlap).
+  - saving an event that clashes shows a heads-up banner.
+
+  find a time
+  - working hours are editable per weekday with a timezone, defaulting to
+    mon-fri 9-5 in your browser's zone, and are saved when you search.
+  - it suggests the earliest open slot (rounded to 15 minutes) in each free
+    block, shows the free ranges per day for context, and never suggests a time
+    in the past.
+  - clicking a suggestion opens a prefilled new event.
+
+  other bugs found by stress testing (each now has a regression test):
+  1. events crossing a DST change reported the wrong duration. python measures
+     two times in the same zone by clock time, so a 6h overnight event read as
+     5h. the edit dialog would then save the shorter duration. times are now
+     stored in UTC internally.
+  2. rules that produce no occurrences were accepted, leaving invisible ghost
+     events. "first occurrence" checks also assumed the start date was itself an
+     occurrence.
+  3. the biweekly cadence break described above.
+  4. until didn't move with a shifted series.
+  5. a timezone-tagged occurrence key in the URL created a duplicate occurrence,
+     and a timezone-tagged override start had its offset silently dropped.
+  6. 90-second durations silently became 60 seconds on save, and blank override
+     titles were accepted.
+  7. a date window near the year 9999 crashed the API with a 500.
+
+  HYPOTHESIS_PROFILE=heavy uv run pytest runs the long stress pass (~35s). the
+  README now covers the extensions, these semantics, and the bug log.
+
+  still open
+  - the save heads-up only checks the week on screen. if you move an event into
+    a clash in another week, it stays quiet.
+  - multi-attendee scheduling is the natural next extension, and it reuses the
+    same free-time math.
+  - "time spent" in the README is still yours to fill in.
+
+  want me to commit?
+
+✻ Worked for 14m 59s · done Thursday 6:17 PM
+
+❯ commit. then add support for dragging (15 min intervals within the calendar   
+  app) to add new events, and dragging existing events' edges up/down to change 
+  their durations.                                                              
+
+⏺ committing first. checking exactly what will be staged:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ clean set: no data file, venv, node_modules, or build output. main has no
+  commits yet, so i'm making this the initial commit on main rather than
+  branching off nothing.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Committed as 9e8b145. Next I'm building drag support: dragging on empty grid
+  creates a snapped event, and dragging an event's edge resizes it, with a "this
+  / following / all" picker for recurring events. The drag logic will live in a
+  tested lib/drag.ts, plus an end-to-end check in Chromium.
+
+⏺ Write(web/app/lib/drag.ts)
+  ⎿  Wrote 48 lines to web/app/lib/drag.ts
+      1 // Pure drag math for the week grid, in minutes from local midnig
+        ht.
+      2 
+      3 export const SNAP = 15;
+      4 export const DAY_MIN = 24 * 60;
+      5 
+      6 const clamp = (m: number) => Math.max(0, Math.min(DAY_MIN, m));
+      7 export const snapDown = (m: number) => Math.floor(m / SNAP) * SNA
+        P;
+      8 export const snapUp = (m: number) => Math.ceil(m / SNAP) * SNAP;
+     … +40 lines (ctrl+o to expand)
+
+⏺ Write(web/app/lib/drag.test.ts)
+  ⎿  Wrote 54 lines to web/app/lib/drag.test.ts
+       1 // Run with: npm test  (node's built-in runner; Node strips the 
+         TS types)
+       2 import assert from "node:assert/strict";
+       3 import { test } from "node:test";
+       4 import { addMinutesNaive, createRange, minutesToTime, resizeEdge
+         , resizeResult } from "./drag.ts";
+       5 
+       6 test("createRange snaps outward and is at least one slot", () =>
+          {
+       7   assert.deepEqual(createRange(600, 600), [600, 615]); // click-
+     … +48 lines (~2 KB) (ctrl+o to expand)
+
+⏺ Bash(cd /Users/paulyoon/Projects/numenor-take-home/web && python3 - <<'EOF'
+      import json…)
+  ⎿  Error: Cannot find module '/Users/paulyoon/Projects/numenor-take-home/
+     web/app/lib'
+  ⎿  Updated web/package.json (+2 -1)
+       4    "scripts": {
+       5      "dev": "next dev -p 3000",
+       6      "build": "next build",
+       7 -    "start": "next start -p 3000"                              
+       7 +    "start": "next start -p 3000",                             
+       8 +    "test": "node --test app/lib/"                             
+       9    },
+      10    "dependencies": {
+      11      "next": "^15.5.28",
+  ⎿  Updated web/tsconfig.json (+1 -0)
+       6      "skipLibCheck": true,
+       7      "strict": true,
+       8      "noEmit": true,
+       9 +    "allowImportingTsExtensions": true,                        
+      10      "esModuleInterop": true,
+      11      "module": "esnext",
+      12      "moduleResolution": "bundler",
+
+⏺ Bash(sed -i '' 's#"node --test app/lib/"#"node --test app/lib/*.test.ts"#'
+      package.json && npm test 2>&1 | grep -E "^# (pass|fail)|not
+      ok|Error|warning" )
+  ⎿  To eliminate this warning, add "type": "module" to /Users/paulyoon/Pro
+     jects/numenor-take-home/web/package.json.
+     (Use `node --trace-warnings ...` to show where the warning was created
+     )
+  ⎿  Updated web/package.json (+1 -1)
+       5      "dev": "next dev -p 3000",
+       6      "build": "next build",
+       7      "start": "next start -p 3000",
+       8 -    "test": "node --test app/lib/"                             
+       8 +    "test": "node --test app/lib/*.test.ts"                    
+       9    },
+      10    "dependencies": {
+      11      "next": "^15.5.28",
+
+  Ran 1 shell command (ctrl+o to expand)
+⏺ All 7 tests pass, and Node flagged a module-type warning, so I'm adding
+  "type": "module" to package.json; the build will confirm it's fine. Next I'm
+  switching the layout to endsHere so handles only show on real edges.
+
+⏺ Bash(python3 - <<'EOF'
+      import json…)
+  ⎿  ℹ pass 7
+     ℹ fail 0
+  ⎿  Updated web/app/lib/dates.ts (+6 -2)
+      38    col: number;
+      39    cols: number;
+      40    continues: boolean; // started on a previous day
+      41 +  endsHere: boolean; // false when clipped at midnight         
+      42  }
+      43  
+      44  /** Clip occurrences to one day and lay out overlapping ones si
+          de by side. */
+     ...
+      54        const ce = Math.min(e, dayEnd);
+      55        const top = cs === dayStart ? 0 : minutesIntoDay(new Date
+          (cs));
+      56        const bottom = ce === dayEnd ? 24 * 60 : minutesIntoDay(n
+          ew Date(ce));
+      56 -      return { occ, top, height: bottom - top, s: cs, e: ce, co
+         -ntinues: s < dayStart };                                       
+      57 +      return { occ, top, height: bottom - top, s: cs, e: ce, co
+         +ntinues: s < dayStart, endsHere: e <= dayEnd };                
+      58      })
+      59      .filter((x): x is NonNullable<typeof x> => x !== null)
+      60      .sort((a, b) => a.s - b.s || b.e - a.e);
+     ...
+      73      const used = new Set(cluster.filter((b) => b.e > seg.s).map
+          ((b) => b.col));
+      74      let col = 0;
+      75      while (used.has(col)) col++;
+      75 -    cluster.push({ occ: seg.occ, top: seg.top, height: seg.heig
+         -ht, col, cols: 1, continues: seg.continues, e: seg.e });       
+      76 +    cluster.push({                                             
+      77 +      occ: seg.occ, top: seg.top, height: seg.height, col, cols
+         +: 1,                                                           
+      78 +      continues: seg.continues, endsHere: seg.endsHere, e: seg.
+         +e,                                                             
+      79 +    });                                                        
+      80      clusterEnd = Math.max(clusterEnd, seg.e);
+      81    }
+      82    if (cluster.length) flush();
+  ⎿  Updated web/package.json (+1 -0)
+      1  {
+      2    "name": "calendar-web",
+      3    "private": true,
+      4 +  "type": "module",                                             
+      5    "scripts": {
+      6      "dev": "next dev -p 3000",
+      7      "build": "next build",
+
+⏺ now the main component. re-reading it before editing:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Bash(python3 - <<'EOF'
+      p='app/components/CalendarApp.tsx'; s=open(p).read()…)
+  ⎿  169:      createAt(d.day, d.start, d.moved ? d.end - d.start : undefin
+     ed);
+     256:        <button className="primary" onClick={() => createAt(days.f
+     … +2 lines (ctrl+o to expand)
+  ⎿  Updated web/app/components/CalendarApp.tsx (+188 -23)
+       5  import {
+       6    addDays, browserTz, fmtTime, hueFor, isoDate, isoTime, layout
+          Day, minutesIntoDay, sameDay, startOfWeek,
+       7  } from "../lib/dates";
+       8 +import { createRange, minutesToTime, resizeEdge, resizeResult }
+         + from "../lib/drag";                                           
+       9  import { EventDialog, type DialogState } from "./EventDialog";
+      10  import { FindTimeDialog } from "./FindTimeDialog";
+      11  
+     ...
+      20    occ: Occurrence;
+      21  }
+      22  
+      23 +type Drag =                                                    
+      24 +  | { kind: "create"; day: Date; col: HTMLElement; anchor: numb
+         +er; start: number; end: number; moved: boolean }               
+      25 +  | {                                                          
+      26 +      kind: "resize"; occ: Occurrence; day: Date; col: HTMLElem
+         +ent; edge: "top" | "bottom";                                   
+      27 +      orig: { top: number; bottom: number }; top: number; botto
+         +m: number; moved: boolean;                                     
+      28 +    };                                                         
+      29 +                                                               
+      30 +/** A finished resize of a recurring event, waiting for the use
+         +r to choose a scope. */                                        
+      31 +interface ScopePick {                                          
+      32 +  x: number;                                                   
+      33 +  y: number;                                                   
+      34 +  occ: Occurrence;                                             
+      35 +  start: string;                                               
+      36 +  duration: number;                                            
+      37 +}                                                              
+      38 +                                                               
+      39 +const gridMinutes = (col: HTMLElement, clientY: number) => (cli
+         +entY - col.getBoundingClientRect().top) / PX_PER_MIN;          
+      40 +                                                               
+      41  export default function CalendarApp() {
+      42    const [weekStart, setWeekStart] = useState(() => startOfWeek(
+          new Date()));
+      43    const [occs, setOccs] = useState<Occurrence[]>([]);
+     ...
+      50    const [menu, setMenu] = useState<Menu | null>(null);
+      51    const [now, setNow] = useState(() => new Date());
+      52    const [tz, setTz] = useState("");
+      53 +  const [drag, setDrag] = useState<Drag | null>(null);         
+      54 +  const [scopePick, setScopePick] = useState<ScopePick | null>(
+         +null);                                                         
+      55 +  const dragRef = useRef<Drag | null>(null);                   
+      56 +  const suppressClick = useRef(false);                         
+      57    const scroller = useRef<HTMLDivElement>(null);
+      58  
+     … 244 more lines (ctrl+o to expand)
+  ⎿  Updated web/app/globals.css (+21 -0)
+      197  .result-slots { display: flex; flex-wrap: wrap; gap: 6px; }
+      198  .slot { font-variant-numeric: tabular-nums; border-color: var(
+           --accent); color: var(--accent); }
+      199  .slot:hover { background: var(--accent); color: var(--accent-t
+           ext); }
+      200 +                                                              
+      201 +/* dragging */                                                
+      202 +.day-col.dragging { cursor: ns-resize; user-select: none; }   
+      203 +.event .handle {                                              
+      204 +  position: absolute; left: 0; right: 0; height: 6px; cursor: 
+          +ns-resize; touch-action: none; z-index: 1;                    
+      205 +}                                                             
+      206 +.event .handle.top { top: -1px; }                             
+      207 +.event .handle.bottom { bottom: -1px; }                       
+      208 +.event .handle.bottom::after {                                
+      209 +  content: ""; position: absolute; left: 50%; bottom: 2px; wid
+          +th: 18px; height: 2px; margin-left: -9px;                     
+      210 +  border-radius: 2px; background: currentColor; opacity: 0; tr
+          +ansition: opacity 0.12s;                                      
+      211 +}                                                             
+      212 +.event:hover .handle.bottom::after { opacity: 0.35; }         
+      213 +.event.resizing { z-index: 4; box-shadow: var(--shadow); }    
+      214 +.ghost {                                                      
+      215 +  position: absolute; left: 2px; right: 2px; z-index: 3; point
+          +er-events: none;                                              
+      216 +  border-radius: 5px; padding: 3px 6px; font-size: 12px; font-
+          +weight: 500;                                                  
+      217 +  background: color-mix(in srgb, var(--accent) 22%, transparen
+          +t);                                                           
+      218 +  border: 1.5px dashed var(--accent); color: var(--text); font
+          +-variant-numeric: tabular-nums;                               
+      219 +}                                                             
+      220 +.menu-label { padding: 6px 10px 4px; font-size: 12px; color: v
+          +ar(--muted); }                                                
+
+⏺ type-check passes. one bug i can see before testing: escape mid-drag clears
+  the state but not the ref, so the pointerup would still commit the resize.
+  fixing:
+
+⏺ Bash(python3 - <<'EOF'
+      p='app/components/CalendarApp.tsx'; s=open(p).read()…)
+  ⎿  ok
+  ⎿  Updated web/app/components/CalendarApp.tsx (+10 -2)
+       96        if (suppressClick.current) return; // the click that end
+           s a drag
+       97        setMenu(null);
+       98        setScopePick(null);
+       99 +      dragRef.current = null;                                 
+      100 +      setDrag(null);                                          
+      101 +    };                                                        
+      102 +    const onKey = (e: KeyboardEvent) => {                     
+      103 +      if (e.key !== "Escape") return;                         
+      104 +      setMenu(null);                                          
+      105 +      setDialog(null);                                        
+      106 +      setFindTime(false);                                     
+      107 +      setScopePick(null);                                     
+      108 +      dragRef.current = null; // also aborts a drag in progres
+          +s; pointerup then finds nothing                               
+      109        setDrag(null);
+      110      };
+      101 -    const onKey = (e: KeyboardEvent) =>                       
+      102 -      e.key === "Escape" && (setMenu(null), setDialog(null), s
+          -etFindTime(false), setScopePick(null), setDrag(null));        
+      111      window.addEventListener("click", close);
+      112      window.addEventListener("keydown", onKey);
+      113      return () => { window.removeEventListener("click", close);
+            window.removeEventListener("keydown", onKey); };
+
+⏺ now the end-to-end test in chromium with real mouse drags:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ All of the checks pass, including the upward drag from 15:00 to 13:50 (giving
+  13:45–15:15) and the cancel case that restores the saved 45-minute standup.
+  I'm now looking at the ghost and scope-picker screenshots.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ both look right, and the resize even triggered the conflict heads-up (design
+  review now overlaps lunch). updating the README:
+
+⏺ Bash(python3 - <<'EOF'
+      p='README.md'; s=open(p).read()…)
+  ⎿  97 passed, 1 warning in 2.43s
+     ℹ pass 7
+     ℹ fail 0
+     … +9 lines (ctrl+o to expand)
+  ⎿  Updated README.md (+8 -2)
+      35  
+      36  Open http://localhost:3000.
+      37  
+      38 -- **Create:** click **+ New event**, or click an empty slot in 
+         -the grid to prefill that time.                                 
+      38 +- **Create:** click **+ New event**, or click an empty slot in 
+         +the grid to prefill that time (1 hour). Or **drag** down or up 
+         +on empty grid to select a range in 15-minute steps; releasing o
+         +pens the dialog prefilled with that range.                     
+      39 +- **Resize:** drag an event's **bottom edge** to change its dur
+         +ation, or its **top edge** to change its start while keeping th
+         +e end. Snaps to 15 minutes with a live preview.                
+      40 +  - Non-recurring events save on release. Recurring ones ask *T
+         +his event / This and following / All events* at the cursor.    
+      41 +  - Esc mid-drag, or Cancel, puts it back.                     
+      42 +  - Edges cut off at midnight have no handle.                  
+      43  - **Edit / reschedule:** click an event. For recurring events, 
+          pick *This event*, *This and following*, or *All events*.
+      44  - **Cancel:** right-click an event, or use Delete in the edit d
+          ialog.
+      45  - **Navigate:** use ‹ / › / Today to move between weeks. The gr
+          id scrolls vertically through the day.
+     ...
+      53  ```sh
+      54  cd backend && uv run pytest                              # ~2s
+      55  cd backend && HYPOTHESIS_PROFILE=heavy uv run pytest     # ~35s
+          , 5000 examples per property
+      56 +cd web && npm test                                       # drag
+         + math (node's built-in test runner)                            
+      57  ```
+      58  
+      59  ## Data model
+     ...
+      161  - JSON persistence, REST API, and a week-view UI with a create
+           /edit dialog and right-click menu.
+      162  - Conflict detection with explanations (panel, in-grid markers
+           , heads-up on save).
+      163  - Meeting time recommendations within configurable working hou
+           rs.
+      164 +- Drag to create, and drag event edges to resize, in 15-minute
+          + steps. The drag math is a pure module with unit tests, and th
+          +e interactions were checked end to end in Chromium.           
+      165  - pytest + hypothesis suite (97 tests) covering recurrence mat
+           h, DST edge cases, exceptions, scopes, rollback, persistence, 
+           scheduling, and the API.
+      166  
+      167  ## Time spent
+     ...
+      173  - **Multi-attendee search:** the same gap math over the union 
+           of several calendars' busy time, intersected with each attende
+           e's working hours.
+      174  - The save heads-up only checks the visible week. Checking the
+            saved event's own dates would catch a clash after moving it t
+           o another week.
+      175  - **Performance for large calendars:** index events by active 
+           date range (start to until) so a window query skips series tha
+           t can't intersect it.
+      170 -- Drag-to-move and resize in the grid, plus month view.       
+      176 +- Drag an event's body to move it (including across days), plu
+          +s a month view. Resizing an event by dragging into another day
+          + isn't supported yet; edges stay within their column.         
+      177  - RFC 5545 import/export (`RRULE`/`EXDATE`/`RECURRENCE-ID` map
+            almost 1:1 onto this model).
+  ⎿  (timeout 5m)
+
+⏺ reseeding so the demo data is clean after my test drags:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ the earlier work is committed as 9e8b145, and dragging to create and dragging
+  edges to resize now both work. you didn't say to commit the drag work, so it's
+  uncommitted. main had no commits, so i made that first commit directly on
+  main rather than branching off nothing.
+
+  drag to create
+  - press on empty grid and drag up or down. a dashed preview block shows the
+    time range, snapped to 15 minutes.
+  - on release, the new-event dialog opens prefilled with that range.
+  - a plain click still creates a 1-hour event, now at the clicked 15-minute
+    slot instead of the half hour.
+
+  drag edges to resize
+  - the bottom edge changes the duration. the top edge moves the start and keeps
+    the end fixed. both snap to 15 minutes with a live time label, and an event
+    can't shrink below 15 minutes.
+  - a one-off event saves on release. a recurring one pops a "this event / this
+    and following / all events" picker at the cursor and keeps the preview until
+    you choose. cancel or esc puts it back.
+  - resizing into a clash triggers the conflict banner, same as saving from the
+    dialog.
+  - edges cut off at midnight get no handle, so you can't drag a fake edge.
+
+  testing
+  - unit tests: the drag math lives in web/app/lib/drag.ts, with 7 tests (npm 
+    test, node's built-in runner, no new dependency). one covers an event shown
+    in your timezone but stored in another, since the saved start has to be in
+    the event's own zone.
+  - in the browser: i ran every interaction with real mouse drags in chromium:
+    drag down, drag up, plain click, both edges on a one-off event, the scope
+    picker on a recurring event, esc mid-drag, cancel, and plain click still
+    opening the edit dialog. all behaved correctly, with no console errors.
+  - backend: 97 tests still pass.
+
+  caught along the way: esc mid-drag cleared the preview but didn't stop the
+  drag, so releasing the mouse would still have saved the resize. fixed before
+  testing, and the test confirms nothing gets saved.
+
+  changes and limits
+  - web/package.json now has "type": "module", so node's test runner stops
+    warning, and tsconfig.json allows .ts import extensions for the test file.
+    type-check passes. i didn't run next build, because last time it broke the
+    running dev server.
+  - dragging an event's body to move it isn't built, and edges can't be dragged
+    into another day. both are listed under "next" in the README.
+
+  both servers are still running with fresh demo data at http://localhost:3000.
+  want me to commit the drag work?
+
+✻ Brewed for 4m 9s · done 12:10 AM
+  ⎿  Read ../web/app/lib/drag.test.ts (55 lines)
+  ⎿  Read ../web/app/lib/drag.ts (49 lines)
+  ⎿  Referenced file ../web/app/components/CalendarApp.tsx
+  ⎿  Read ../web/app/components/FindTimeDialog.tsx (193 lines)
+  ⎿  Read ../web/app/lib/api.ts (125 lines)
+  ⎿  Skills restored (yab-browser)
+
+⏺ Compacted while idle, before the prompt cache expired · turn off with 
+  "idleCompaction": false in settings.json
+
+❯ yes commit. awesome                                                           
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  PostToolUse:Bash says: Tip: Run /ultrareview before you push to catch bugs 
+     with a cloud-based multi-agent review — 3 free reviews left.
+
+⏺ the drag work is committed on main as 7cc4f57, right after 9e8b145. the
+  working tree is clean.
+
+  two things are left before you submit:
+  - the README's "time spent" line is still _TODO(paul): fill in._.
+  - the exported transcript.
+
+  if you want another extension, dragging an event's body to move it would be
+  the natural next one.
+
+✻ Crunched for 6s · done 1:16 AM

@@ -166,7 +166,7 @@ These found real bugs, each now covered by a regression test:
 
 ## Time spent
 
-_TODO(paul): fill in._
+About 90 minutes, including the extensions.
 
 ## Next
 
